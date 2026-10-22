@@ -5,7 +5,7 @@ from accounts.models import Role, User
 # Development-only credentials. Never use these outside a local machine.
 SEEDS = [
     ("superadmin", "superadmin@example.com", Role.SUPER_ADMIN, "superadmin@123"),
-    ("admin", "admin@example.com", Role.ADMIN, "admin123"),
+    ("admin", "admin@example.com", Role.ADMIN, "admin@123"),
     ("student", "student@example.com", Role.STUDENT, "student@123"),
 ]
 
