@@ -1,0 +1,11 @@
+Django>=5.2,<7
+djangorestframework>=3.16
+djangorestframework-simplejwt>=5.5
+django-cors-headers>=4.7
+django-filter>=25.1
+python-dotenv>=1.1
+Pillow>=11
+openpyxl>=3.1
+xlrd>=2.0.1
+pypdf>=5
+reportlab>=4.2
