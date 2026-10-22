@@ -15,3 +15,4 @@ if __name__ == "__main__":
 
 
 # py manage.py runserver 8000
+# gunicorn config.wsgi:application
