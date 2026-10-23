@@ -18,6 +18,7 @@ from questionbank.models import Question
 
 from . import services as svc
 from .models import Attempt, AttemptQuestion, AttemptSection
+from . import activity
 from .results import build_result
 
 
@@ -31,6 +32,13 @@ def exam_card(request, exam, user, now, active_by_exam, used_by_exam):
     active = active_by_exam.get(exam.id)
     used = used_by_exam.get(exam.id, 0)
     status, can_start, reason = svc.student_state(exam, user, now, active=active or False, used=used)
+    locked = False
+    if exam.is_premium:
+        if not hasattr(request, "_premium_ids"):
+            request._premium_ids = svc.premium_entitlements(user)  # worked out once per request, not once per card
+        locked = exam.id not in request._premium_ids and not active
+        if locked and can_start:
+            status, can_start, reason = "locked", False, svc.PREMIUM_MESSAGE
     return {
         "id": exam.public_id,
         "title": exam.title,
@@ -56,6 +64,9 @@ def exam_card(request, exam, user, now, active_by_exam, used_by_exam):
         "can_start": can_start,
         "reason": reason,
         "active_attempt_id": active.public_id if active else None,
+        "premium": exam.is_premium,
+        "price": str(exam.price) if exam.price is not None else None,
+        "locked": locked,
     }
 
 
@@ -200,7 +211,7 @@ class StudentExamDetail(APIView):
     permission_classes = [IsStudent]
 
     def get(self, request, pid):
-        exam = get_object_or_404(svc.visible_exams(request.user).select_related("category", "subject"), public_id=pid)
+        exam = get_object_or_404(svc.visible_exams(request.user, include_practice=True).select_related("category", "subject"), public_id=pid)
         active, used = _context(request.user)
         data = exam_card(request, exam, request.user, timezone.now(), active, used)
         data["instructions"] = exam.instructions
@@ -218,7 +229,7 @@ class StartAttempt(APIView):
     permission_classes = [IsStudent]
 
     def post(self, request, pid):
-        exam = get_object_or_404(svc.visible_exams(request.user), public_id=pid)
+        exam = get_object_or_404(svc.visible_exams(request.user, include_practice=True), public_id=pid)
         try:
             attempt, created = svc.start_attempt(exam, request.user)
         except svc.CannotStart as e:
@@ -430,7 +441,13 @@ class AttemptResult(APIView):
             return Response({"detail": "Submit the attempt to see its result."}, status=409)
         if not svc.result_visible(attempt.exam):
             return Response({"detail": "Your result has not been released yet.", "result_available": False}, status=403)
-        return Response(build_result(attempt, request, reveal_solutions=svc.solutions_visible(attempt.exam)))
+        reveal = svc.solutions_visible(attempt.exam)
+        data = build_result(attempt, request, reveal_solutions=reveal)
+        if reveal:
+            from .saved_views import annotate_result
+
+            annotate_result(attempt, data)
+        return Response(data)
 
 
 class AttemptHistory(APIView):
@@ -522,5 +539,6 @@ class StudentDashboard(APIView):
                  "marks": str(v["marks"]), "max_marks": str(v["max"])}
                 for name, v in sorted(subjects.items())
             ],
+            "activity": activity.summary(user),
             "recommended": [c for c in cards if c["status"] == "available" and c["id"] not in attempted_exam_ids][:4],
         })

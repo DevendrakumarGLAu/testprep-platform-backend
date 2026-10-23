@@ -7,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.models import log_activity
+from notifications import services as notifications
 from accounts.permissions import IsAdminOrSuperAdmin
 from exams.models import Exam
 
@@ -154,7 +155,85 @@ class ReleaseControl(APIView):
         setattr(exam, flag, value)
         exam.save(update_fields=[flag, "updated_at"])
         log_activity(request.user, f"exam.{self.action_name.replace('-', '_')}", exam)
+        if self.action_name == "release-results" and value:
+            notifications.on_results_released(exam)
         return Response({
             "results_released": exam.results_released, "solutions_released": exam.solutions_released,
             "results_visible": svc.result_visible(exam), "solutions_visible": svc.solutions_visible(exam),
+        })
+
+
+def _submitted():
+    """Real tests only: a student's own practice sets are left out of the admin's numbers."""
+    return Attempt.objects.filter(status=Attempt.Status.SUBMITTED, exam__is_practice=False)
+
+
+class AdminInsights(APIView):
+    """Where the platform is used and where students struggle: busiest tests, hardest questions, most skipped questions."""
+
+    permission_classes = [IsAdminOrSuperAdmin]
+    MIN_ANSWERS = 5  # a question needs this many attempts before it is ranked
+
+    def get(self, request):
+        done = _submitted()
+        tests = []
+        for e in (
+            Exam.objects.filter(is_practice=False).annotate(n=Count("attempts", filter=Q(attempts__status=Attempt.Status.SUBMITTED)))
+            .filter(n__gt=0).order_by("-n", "title")[:8]
+        ):
+            scores = done.filter(exam=e).aggregate(avg=Avg("score"), total=Max("total_marks"))
+            pct = round(float(scores["avg"]) / float(scores["total"]) * 100, 1) if scores["avg"] is not None and scores["total"] else None
+            tests.append({"id": e.id, "title": e.title, "attempts": e.n, "average_percent": pct})
+
+        rows = (
+            AttemptQuestion.objects.filter(attempt__in=done, question__isnull=False)
+            .values("question", "question__subject__name")
+            .annotate(
+                text=Max("text"), text_hi=Max("text_hi"), total=Count("id"),
+                answered=Count("id", filter=Q(is_correct__isnull=False)), correct=Count("id", filter=Q(is_correct=True)),
+            )
+            .filter(total__gte=self.MIN_ANSWERS)
+        )
+        stats = [
+            {
+                "question": r["question"], "text": (r["text"] or r["text_hi"])[:160], "subject": r["question__subject__name"],
+                "attempts": r["total"],
+                "correct_percent": round(r["correct"] * 100 / r["answered"], 1) if r["answered"] else None,
+                "skipped_percent": round((r["total"] - r["answered"]) * 100 / r["total"], 1),
+            }
+            for r in rows
+        ]
+        hardest = sorted((s for s in stats if s["correct_percent"] is not None), key=lambda s: (s["correct_percent"], -s["attempts"]))[:10]
+        skipped = sorted((s for s in stats if s["skipped_percent"] > 0), key=lambda s: (-s["skipped_percent"], -s["attempts"]))[:10]
+        return Response({
+            "attempts": done.count(), "tests": tests, "hardest": hardest, "most_skipped": skipped,
+            "min_answers": self.MIN_ANSWERS,
+        })
+
+
+class ExamDropoff(APIView):
+    """For one test: how many students answered, got right and spent time on each question number. Shows where they give up."""
+
+    permission_classes = [IsAdminOrSuperAdmin]
+
+    def get(self, request, pk):
+        exam = get_object_or_404(Exam, pk=pk, is_practice=False)
+        done = Attempt.objects.filter(exam=exam, status=Attempt.Status.SUBMITTED)
+        n = done.count()
+        rows = (
+            AttemptQuestion.objects.filter(attempt__in=done).values("order")
+            .annotate(total=Count("id"), answered=Count("id", filter=Q(is_correct__isnull=False)),
+                      correct=Count("id", filter=Q(is_correct=True)), avg=Avg("time_spent_seconds"))
+            .order_by("order")
+        )
+        return Response({
+            "exam": exam.title, "attempts": n,
+            "positions": [
+                {
+                    "number": r["order"] + 1, "answered_percent": round(r["answered"] * 100 / r["total"], 1),
+                    "correct_percent": round(r["correct"] * 100 / r["answered"], 1) if r["answered"] else None,
+                    "average_seconds": round(r["avg"] or 0),
+                }
+                for r in rows
+            ],
         })

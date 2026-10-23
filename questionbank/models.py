@@ -73,6 +73,11 @@ class Source(models.TextChoices):
     WEB = "web", "Website extraction"
 
 
+class ReviewStatus(models.TextChoices):
+    APPROVED = "approved", "Approved"
+    NEEDS_REVIEW = "needs_review", "Needs review"
+
+
 class Question(models.Model):
     # English is `text`; Hindi is `text_hi`. At least one language must be complete (checked by the serializer).
     text = models.TextField(blank=True)
@@ -84,11 +89,18 @@ class Question(models.Model):
     question_type = models.CharField(max_length=20, choices=QuestionType.choices, default=QuestionType.SINGLE_MCQ)
     explanation = models.TextField(blank=True)
     explanation_hi = models.TextField(blank=True)
+    # A video explaining the solution (for example a YouTube link). Shown to students in their review.
+    video_url = models.URLField(max_length=300, blank=True)
     marks = models.DecimalField(max_digits=6, decimal_places=2, default=1)
     negative_marks = models.DecimalField(max_digits=6, decimal_places=2, default=0)  # stored as a positive deduction
+    # The date the question is about or was set (for current affairs: when the event happened). Admins use it to keep
+    # tests to recent material. Not the same as created_at, which is when the row was typed in.
+    question_date = models.DateField(null=True, blank=True, db_index=True)
     tags = models.ManyToManyField(Tag, blank=True, related_name="questions")
     image = models.ImageField(upload_to="questions/", null=True, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
+    # Set to needs_review when a student reports a problem; a test cannot be published while it holds such a question.
+    review_status = models.CharField(max_length=14, choices=ReviewStatus.choices, default=ReviewStatus.APPROVED, db_index=True)
     source = models.CharField(max_length=10, choices=Source.choices, default=Source.MANUAL)
     source_info = models.CharField(max_length=255, blank=True)
     # Bumped whenever scoring-relevant content changes, so attempts can tell which version they saw.
@@ -123,3 +135,39 @@ class QuestionOption(models.Model):
 
     class Meta:
         ordering = ["order", "id"]
+
+
+class QuestionReport(models.Model):
+    """A student's note that a question is wrong, kept until an admin deals with it."""
+
+    class Reason(models.TextChoices):
+        WRONG_ANSWER = "wrong_answer", "The marked answer is wrong"
+        WRONG_QUESTION = "wrong_question", "The question is wrong or unclear"
+        TYPO = "typo", "Spelling or typing mistake"
+        TRANSLATION = "translation", "Hindi and English do not match"
+        OTHER = "other", "Something else"
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED = "resolved", "Fixed"
+        REJECTED = "rejected", "No change needed"
+
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name="reports")
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="question_reports")
+    # Where the student saw it. SET_NULL so a deleted attempt does not erase the report.
+    attempt_question = models.ForeignKey("attempts.AttemptQuestion", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    exam_title = models.CharField(max_length=200, blank=True)
+    reason = models.CharField(max_length=16, choices=Reason.choices)
+    message = models.TextField(blank=True)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
+    admin_note = models.TextField(blank=True)
+    resolved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            # One open report per student per question: a second one updates the first.
+            models.UniqueConstraint(fields=["question", "student"], condition=models.Q(status="open"), name="one_open_report_per_student"),
+        ]

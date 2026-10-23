@@ -138,9 +138,9 @@ class ImportViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
         bad = [h for k, v in mapping.items() for h in (v if isinstance(v, list) else [v]) if h and h not in headers]
         if bad:
             raise serializers.ValidationError({"mapping": f"Unknown column(s): {', '.join(map(str, bad))}."})
-        if not mapping.get("question"):
-            raise serializers.ValidationError({"mapping": "Choose the column that holds the question text."})
-        if len(mapping.get("options", [])) < 2:
+        if not mapping.get("question") and not mapping.get("question_hi"):
+            raise serializers.ValidationError({"mapping": "Choose the column that holds the question text (English or Hindi)."})
+        if max(len(mapping.get("options", [])), len(mapping.get("options_hi", []))) < 2:
             raise serializers.ValidationError({"mapping": "Choose at least two option columns."})
         try:
             job = pipeline.process_job(job, mapping, defaults, bool(request.data.get("create_missing")))
@@ -174,7 +174,7 @@ class ImportViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
             if errors:
                 row.status, row.selected = ImportRow.State.INVALID, False
             else:
-                found = ctx.find_duplicate(norm["question"], norm["subject_id"])
+                found = ctx.find_duplicate(norm["display"], norm["subject_id"])
                 if found:
                     row.status, row.selected = ImportRow.State.DUPLICATE, False
                     row.duplicate_of_id = found[0]

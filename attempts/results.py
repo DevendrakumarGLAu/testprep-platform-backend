@@ -87,6 +87,7 @@ def build_result(attempt: Attempt, request, reveal_solutions: bool, include_stud
                 "marks_awarded": money(aq.marks_awarded),
                 "explanation": aq.explanation,
                 "explanation_hi": aq.explanation_hi,
+                "video_url": aq.video_url,
             })
         questions.append(item)
 

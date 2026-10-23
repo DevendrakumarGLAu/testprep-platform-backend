@@ -67,6 +67,7 @@ class AttemptQuestion(models.Model):
     options = models.JSONField()  # [{"id": 1, "text": "...", "is_correct": bool}] in the order shown
     explanation = models.TextField(blank=True)
     explanation_hi = models.TextField(blank=True)
+    video_url = models.URLField(max_length=300, blank=True)
     marks = models.DecimalField(max_digits=6, decimal_places=2)
     negative_marks = models.DecimalField(max_digits=8, decimal_places=4, default=0)
 
@@ -104,3 +105,27 @@ class AttemptSection(models.Model):
     class Meta:
         ordering = ["order"]
         constraints = [models.UniqueConstraint(fields=["attempt", "order"], name="uniq_attempt_section")]
+
+
+class SavedQuestion(models.Model):
+    """A question a student bookmarked from a result review, with a private note. It is a copy of what they saw, answer included."""
+
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="saved_questions")
+    attempt_question = models.ForeignKey(AttemptQuestion, null=True, blank=True, on_delete=models.SET_NULL, related_name="saved_by")
+    question = models.ForeignKey("questionbank.Question", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    exam_title = models.CharField(max_length=200, blank=True)
+    subject_name = models.CharField(max_length=120, blank=True)
+    text = models.TextField(blank=True)
+    text_hi = models.TextField(blank=True)
+    options = models.JSONField(default=list)  # [{"id", "text", "text_hi", "is_correct"}]
+    selected_option_id = models.IntegerField(null=True, blank=True)
+    explanation = models.TextField(blank=True)
+    explanation_hi = models.TextField(blank=True)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(fields=["student", "attempt_question"], condition=models.Q(attempt_question__isnull=False), name="one_save_per_attempt_question"),
+        ]

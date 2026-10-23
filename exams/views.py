@@ -8,6 +8,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from accounts.models import Role, User, log_activity
+from notifications import services as notifications
 from core.ids import new_public_id
 from core.numbers import money
 from accounts.permissions import IsAdminOrSuperAdmin
@@ -112,6 +113,8 @@ def publish_problems(exam: Exam) -> list[str]:
         q = it.question
         if not q.is_active:
             problems.append(f"Question #{q.id} is inactive.")
+        if q.review_status == "needs_review":
+            problems.append(f"Question #{q.id} needs review (a student reported a problem). Fix it and approve it first.")
         opts = list(q.options.all())
         if len(opts) < 2 or sum(o.is_correct for o in opts) != 1:
             problems.append(f"Question #{q.id} has invalid options.")
@@ -147,7 +150,7 @@ class ExamViewSet(viewsets.ModelViewSet):
     parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     def get_queryset(self):
-        qs = Exam.objects.select_related("category", "subject").prefetch_related("assigned_students", "assigned_batches")
+        qs = Exam.objects.filter(is_practice=False).select_related("category", "subject").prefetch_related("assigned_students", "assigned_batches", "premium_students", "premium_batches")
         return qs.with_totals() if self.action == "list" else qs
 
     def perform_create(self, serializer):
@@ -176,7 +179,7 @@ class ExamViewSet(viewsets.ModelViewSet):
     def _detail(self, exam):
         data = self.get_serializer(exam).data
         data["sections"] = ExamSectionReadSerializer(
-            exam.sections.prefetch_related(Prefetch("items", ExamQuestion.objects.select_related("question__subject"))),
+            exam.sections.prefetch_related(Prefetch("items", ExamQuestion.objects.select_related("question__subject", "section").prefetch_related("question__exam_items__section__exam"))),
             many=True,
         ).data
         return data
@@ -199,6 +202,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.version += 1
         exam.save(update_fields=["status", "published_at", "version", "updated_at"])
         log_activity(request.user, "exam.publish", exam, f"v{exam.version}")
+        notifications.on_test_published(exam)
         return Response(self._detail(exam))
 
     @action(detail=True, methods=["post"])
@@ -261,6 +265,8 @@ class ExamViewSet(viewsets.ModelViewSet):
                 )
             copy.assigned_students.set(src.assigned_students.all())
             copy.assigned_batches.set(src.assigned_batches.all())
+            copy.premium_students.set(src.premium_students.all())
+            copy.premium_batches.set(src.premium_batches.all())
         log_activity(request.user, "exam.duplicate", copy, f"from #{src.pk}")
         return Response(self._detail(copy), status=status.HTTP_201_CREATED)
 
@@ -292,6 +298,20 @@ class ExamViewSet(viewsets.ModelViewSet):
             exam.assigned_batches.set(ser.validated_data["batches"])
         exam.save(update_fields=["updated_at"])
         log_activity(request.user, "exam.assign", exam)
+        return Response(self._detail(exam))
+
+    @action(detail=True, methods=["put"], url_path="premium-access")
+    def premium_access(self, request, pk=None):
+        """Who may start a premium test: {students: [ids], batches: [ids]}. Can be changed at any time, also after publishing."""
+        exam = self.get_object()
+        ser = AssignmentSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        if "students" in ser.validated_data:
+            exam.premium_students.set(ser.validated_data["students"])
+        if "batches" in ser.validated_data:
+            exam.premium_batches.set(ser.validated_data["batches"])
+        exam.save(update_fields=["updated_at"])
+        log_activity(request.user, "exam.premium_access", exam, f"{exam.premium_students.count()} students, {exam.premium_batches.count()} batches")
         return Response(self._detail(exam))
 
     @action(detail=True, methods=["post", "delete"])

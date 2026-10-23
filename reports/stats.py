@@ -110,7 +110,7 @@ def exam_performance(exam: Exam) -> dict:
 def dashboard() -> dict:
     now = timezone.now()
     students = User.objects.filter(role=Role.STUDENT)
-    done = Attempt.objects.filter(status=SUBMITTED)
+    done = Attempt.objects.filter(status=SUBMITTED, exam__is_practice=False)  # practice sets are the students' own
 
     days = [(now - timedelta(days=i)).date() for i in range(13, -1, -1)]
     by_day = dict(
@@ -126,7 +126,7 @@ def dashboard() -> dict:
 
     subjects = subject_breakdown(done.values_list("id", flat=True))
     top = (
-        Exam.objects.annotate(n=Count("attempts", filter=Q(attempts__status=SUBMITTED)))
+        Exam.objects.filter(is_practice=False).annotate(n=Count("attempts", filter=Q(attempts__status=SUBMITTED)))
         .filter(n__gt=0).order_by("-n")[:5]
     )
     recent = done.select_related("student", "exam").order_by("-submitted_at")[:8]
@@ -141,10 +141,10 @@ def dashboard() -> dict:
             "active": Question.objects.filter(is_active=True).count(),
         },
         "tests": {
-            "total": Exam.objects.count(),
-            "published": Exam.objects.filter(status=Exam.Status.PUBLISHED).count(),
-            "draft": Exam.objects.filter(status=Exam.Status.DRAFT).count(),
-            "archived": Exam.objects.filter(status=Exam.Status.ARCHIVED).count(),
+            "total": Exam.objects.filter(is_practice=False).count(),
+            "published": Exam.objects.filter(is_practice=False, status=Exam.Status.PUBLISHED).count(),
+            "draft": Exam.objects.filter(is_practice=False, status=Exam.Status.DRAFT).count(),
+            "archived": Exam.objects.filter(is_practice=False, status=Exam.Status.ARCHIVED).count(),
         },
         "attempts": {
             "submitted": done.count(),

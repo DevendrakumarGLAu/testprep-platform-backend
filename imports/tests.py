@@ -1,5 +1,6 @@
 import csv
 import io
+from unittest import mock
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APITestCase
@@ -101,8 +102,17 @@ class UploadTests(ImportBase):
             self.assertEqual(r.status_code, 400, name)
             self.assertIn(msg.lower(), str(r.data["file"]).lower(), name)
 
+    def test_a_file_larger_than_the_old_5_mb_limit_is_accepted(self):
+        row = ["Padded question? " + "x" * 5000, "a", "b", "c", "d", "A", "", "Maths", "", "easy", "1", "0", ""]
+        data = csv_bytes([row] * 1500)
+        self.assertGreater(len(data), 5 * 1024 * 1024)
+        r = self.upload("large.csv", data)
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.data["total_rows"], 1500)
+
     def test_too_large_and_too_many_rows(self):
-        self.assertEqual(self.upload("big.csv", b"a" * (parsers.MAX_BYTES + 1)).status_code, 400)
+        with mock.patch.object(parsers, "MAX_BYTES", 1024):  # a tiny limit keeps the test light
+            self.assertEqual(self.upload("big.csv", b"a" * 1025).status_code, 400)
         rows = [GOOD] * (parsers.MAX_ROWS + 1)
         self.assertEqual(self.upload("many.csv", csv_bytes(rows)).status_code, 400)
 

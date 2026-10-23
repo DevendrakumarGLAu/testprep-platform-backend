@@ -5,7 +5,7 @@ import re
 from decimal import Decimal
 
 MAX_ROWS = 2000
-MAX_BYTES = 5 * 1024 * 1024
+MAX_BYTES = 100 * 1024 * 1024
 
 
 class ParseError(Exception):
@@ -156,16 +156,57 @@ def parse_pdf_text(text: str):
                "correct_answer", "explanation"]
     rows = []
     warnings = []
+    bilingual = DEVANAGARI.search(text) is not None
+    if bilingual:
+        headers += ["question_hi", "option_a_hi", "option_b_hi", "option_c_hi", "option_d_hi", "option_e_hi", "option_f_hi",
+                    "explanation_hi"]
     for q in questions[:MAX_ROWS]:
-        row = {"question": q["text"], "correct_answer": q["answer"], "explanation": q["explanation"]}
+        row = {"correct_answer": q["answer"]}
+        row["question"], row["question_hi"] = split_languages(q["text"], strip_tag=True)
+        row["explanation"], row["explanation_hi"] = split_languages(q["explanation"])
         for letter in "ABCDEF":
-            row[f"option_{letter.lower()}"] = q["options"].get(letter, "")
+            row[f"option_{letter.lower()}"], row[f"option_{letter.lower()}_hi"] = split_languages(q["options"].get(letter, ""))
+        if not bilingual:
+            row = {k: v for k, v in row.items() if not k.endswith("_hi")}
         rows.append(row)
     if len(questions) > MAX_ROWS:
         warnings.append(f"Only the first {MAX_ROWS} questions were read.")
     if not any(r["correct_answer"] for r in rows):
         warnings.append("No 'Answer:' lines were found. Set the correct answer for each question during review.")
     return headers, rows, warnings
+
+
+DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+EXAM_TAG = re.compile(r"\s*\[[^\]]*\b(?:19|20)\d{2}\b[^\]]*\]\s*$")  # "[SSC CGL 2026 17 Sept 2026 S3]" at the end
+NUMBERISH = re.compile(r"[\d.,%/\-\u2013]+")
+
+
+def split_languages(text: str, strip_tag: bool = False):
+    """
+    Splits "English text ... Hindi text ..." into (english, hindi) at the point where the Devanagari starts.
+    Text in one language only goes to its own side. A number right before the Hindi ("2024 के ...") stays with it.
+    """
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if strip_tag:
+        text = EXAM_TAG.sub("", text).strip()
+    m = DEVANAGARI.search(text)
+    if not m:
+        return text, ""
+    i = m.start()
+    while True:  # let numbers that open the Hindi sentence travel with it
+        head = text[:i].rstrip()
+        k = head.rfind(" ") + 1
+        token = head[k:]
+        if token and NUMBERISH.fullmatch(token) and k > 0:
+            i = k
+        else:
+            break
+    en, hi = text[:i].strip(), text[i:].strip()
+    en = en.rstrip(" ([{-\u2013/|,")
+    hi = hi.strip(" -\u2013/|,")
+    while hi.endswith(")") and hi.count(")") > hi.count("("):
+        hi = hi[:-1].rstrip()
+    return en, hi
 
 
 def _append(cur, field, line):
@@ -181,18 +222,34 @@ def _append(cur, field, line):
         cur["options"][letter] += " " + line
 
 
-def parse_pdf(raw: bytes):
+def _pdf_pages(raw: bytes) -> list[str]:
+    try:
+        import pymupdf
+    except ImportError:  # not installed: fall back to the simpler reader
+        pymupdf = None
+    if pymupdf is not None:
+        try:
+            doc = pymupdf.open(stream=raw, filetype="pdf")
+        except Exception:
+            raise ParseError("This is not a readable PDF file.")
+        if doc.needs_pass:
+            raise ParseError("This PDF is password protected.")
+        return [page.get_text() for page in list(doc)[:200]]
     from pypdf import PdfReader
 
     try:
         reader = PdfReader(io.BytesIO(raw))
         if reader.is_encrypted:
             raise ParseError("This PDF is password protected.")
-        pages = [(p.extract_text() or "") for p in reader.pages[:200]]
+        return [(p.extract_text() or "") for p in reader.pages[:200]]
     except ParseError:
         raise
     except Exception:
         raise ParseError("This is not a readable PDF file.")
+
+
+def parse_pdf(raw: bytes):
+    pages = _pdf_pages(raw)
     text = "\n".join(pages)
     if len(text.strip()) < 10:
         raise ParseError(
@@ -200,6 +257,13 @@ def parse_pdf(raw: bytes):
         )
     headers, rows, warnings = parse_pdf_text(text)
     warnings.insert(0, "PDF layouts vary. Check every question carefully before importing.")
+    broken = text.count("\ufffd")
+    if broken:
+        warnings.insert(
+            0,
+            f"{broken} characters could not be read; the PDF's Hindi font does not carry readable text. "
+            "Those questions will contain gaps. Use an Excel/CSV file or a PDF made from a text document instead.",
+        )
     return headers, rows, warnings
 
 
@@ -216,7 +280,7 @@ def detect_source(filename: str) -> str:
 
 def parse_file(filename: str, raw: bytes):
     if len(raw) > MAX_BYTES:
-        raise ParseError("The file is larger than 5 MB.")
+        raise ParseError(f"The file is larger than {MAX_BYTES // (1024 * 1024)} MB.")
     if not raw:
         raise ParseError("The file is empty.")
     source = detect_source(filename)

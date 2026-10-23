@@ -85,6 +85,12 @@ class Exam(models.Model):
         SECTIONAL = "sectional", "Subject test"
         PREVIOUS_YEAR = "previous_year", "Previous year paper"
 
+    # A private practice set a student built for themselves (weak topics, wrong answers, the daily quiz). It runs through the
+    # normal exam screen but never appears in admin lists, public pages or other students' lists.
+    is_practice = models.BooleanField(default=False, db_index=True)
+    practice_kind = models.CharField(max_length=10, blank=True)  # weak | wrong | daily
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="practice_exams")
+
     public_id = models.CharField(max_length=24, unique=True, editable=False, default=new_public_id)
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True)
@@ -122,6 +128,12 @@ class Exam(models.Model):
     end_at = models.DateTimeField(null=True, blank=True)
 
     access_type = models.CharField(max_length=10, choices=Access.choices, default=Access.PUBLIC, db_index=True)
+    # Premium tests are visible to everyone but can only be started by students an admin has given access to (directly, through a
+    # batch, or by assigning the test). There is no payment gateway: the price is only shown, and access is granted by hand.
+    is_premium = models.BooleanField(default=False, db_index=True)
+    price = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    premium_students = models.ManyToManyField(settings.AUTH_USER_MODEL, blank=True, related_name="premium_exams", limit_choices_to={"role": "student"})
+    premium_batches = models.ManyToManyField("Batch", blank=True, related_name="premium_exams")
     assigned_students = models.ManyToManyField(
         settings.AUTH_USER_MODEL, blank=True, related_name="assigned_exams",
         limit_choices_to={"role": "student"},
@@ -192,6 +204,17 @@ class Exam(models.Model):
                 changed.append(it)
         ExamQuestion.objects.bulk_update(changed, ["marks", "negative_marks"])
         return len(changed)
+
+    def premium_allows(self, user) -> bool:
+        """True for a free test, or when this student has been given access to the premium test."""
+        if not self.is_premium:
+            return True
+        return (
+            self.premium_students.filter(pk=user.pk).exists()
+            or self.premium_batches.filter(students=user, is_active=True).exists()
+            or self.assigned_students.filter(pk=user.pk).exists()
+            or self.assigned_batches.filter(students=user, is_active=True).exists()
+        )
 
     def has_attempts(self) -> bool:
         """Once students have attempted, scoring rules and questions must stay frozen."""

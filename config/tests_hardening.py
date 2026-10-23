@@ -18,9 +18,9 @@ PW = "Str0ng!pass99"
 METHODS = ("get", "post", "put", "patch", "delete")
 
 # Routes any anonymous visitor may call (they handle their own checks).
-PUBLIC = {"api/auth/login/", "api/auth/refresh/", "api/auth/register/", "api/auth/logout/", "api/platform/"}
+PUBLIC = {"api/auth/forgot-password/", "api/auth/reset-password/", "api/auth/verify-email/", "api/health/", "api/public/home/", "api/public/exams/1/", "api/auth/captcha/", "api/auth/login/", "api/auth/refresh/", "api/auth/register/", "api/auth/logout/", "api/platform/"}
 # Routes any signed-in user may call, whatever their role.
-ANY_ROLE = {"api/auth/me/", "api/auth/change-password/"}
+ANY_ROLE = {"api/auth/send-verification/", "api/auth/me/", "api/auth/change-password/", "api/notifications/", "api/notifications/unread-count/", "api/notifications/read/"}
 
 
 def api_routes():

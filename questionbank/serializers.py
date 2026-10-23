@@ -1,7 +1,8 @@
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Question, QuestionOption, Subject, Tag, Topic, text_hash
+from .models import QuestionReport, Question, QuestionOption, Subject, Tag, Topic, text_hash
 
 MIN_OPTIONS, MAX_OPTIONS = 2, 10
 
@@ -64,13 +65,15 @@ class QuestionSerializer(serializers.ModelSerializer):
     topic_name = serializers.CharField(source="topic.name", read_only=True, default=None)
     image_url = serializers.SerializerMethodField()
     languages = serializers.SerializerMethodField()
+    used_in = serializers.SerializerMethodField()
+    open_reports = serializers.SerializerMethodField()
     text = serializers.CharField(allow_blank=True, required=False, trim_whitespace=True)
     text_hi = serializers.CharField(allow_blank=True, required=False, trim_whitespace=True)
 
     class Meta:
         model = Question
         fields = [
-            "id", "text", "text_hi", "languages", "explanation_hi", "subject", "subject_name", "topic", "topic_name", "difficulty", "question_type",
+            "id", "text", "text_hi", "languages", "explanation_hi", "video_url", "question_date", "used_in", "review_status", "open_reports", "subject", "subject_name", "topic", "topic_name", "difficulty", "question_type",
             "explanation", "marks", "negative_marks", "tags", "options", "image_url", "is_active",
             "source", "source_info", "version", "allow_duplicate", "created_at", "updated_at",
         ]
@@ -89,9 +92,26 @@ class QuestionSerializer(serializers.ModelSerializer):
 
     # --- validation -------------------------------------------------------------------------
 
+    def get_open_reports(self, obj):
+        return sum(1 for r in obj.reports.all() if r.status == "open")
+
+    def get_used_in(self, obj):
+        """The tests (not archived ones) this question is part of, so an admin can see where it is already used."""
+        seen = {}
+        for item in obj.exam_items.all():
+            exam = item.section.exam
+            if exam.status != "archived":
+                seen[exam.id] = {"id": exam.id, "title": exam.title, "status": exam.status}
+        return sorted(seen.values(), key=lambda e: e["title"])
+
     def get_languages(self, obj):
         return [code for code, ok in (("en", obj.text and all(o.text for o in obj.options.all())),
                                       ("hi", obj.text_hi and all(o.text_hi for o in obj.options.all()))) if ok]
+
+    def validate_question_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError("The question date cannot be in the future.")
+        return value
 
     def validate_marks(self, value):
         if value <= 0:
@@ -176,6 +196,7 @@ class QuestionSerializer(serializers.ModelSerializer):
         options = validated_data.pop("options")
         tags = validated_data.pop("tags", [])
         validated_data.pop("allow_duplicate", None)
+        validated_data.setdefault("question_date", timezone.localdate())  # typed in today unless the admin says otherwise
         question = Question.objects.create(**validated_data)
         for i, o in enumerate(options):
             QuestionOption.objects.create(
@@ -232,14 +253,53 @@ class QuestionSerializer(serializers.ModelSerializer):
 
 class BulkActionSerializer(serializers.Serializer):
     ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, max_length=500)
-    action = serializers.ChoiceField(choices=["activate", "deactivate", "set_difficulty", "add_tags"])
+    action = serializers.ChoiceField(choices=["activate", "deactivate", "set_difficulty", "add_tags", "set_review_status", "set_question_date", "set_subject"])
     difficulty = serializers.ChoiceField(choices=["easy", "medium", "hard"], required=False)
+    review_status = serializers.ChoiceField(choices=["approved", "needs_review"], required=False)
+    question_date = serializers.DateField(required=False)
+    subject = serializers.PrimaryKeyRelatedField(queryset=Subject.objects.filter(is_active=True), required=False)
     tags = serializers.ListField(child=serializers.CharField(max_length=40), required=False)
 
     def validate(self, attrs):
         if attrs["action"] == "set_difficulty" and "difficulty" not in attrs:
             raise serializers.ValidationError({"difficulty": "Required for this action."})
+        if attrs["action"] == "set_question_date":
+            if "question_date" not in attrs:
+                raise serializers.ValidationError({"question_date": "Required for this action."})
+            if attrs["question_date"] > timezone.localdate():
+                raise serializers.ValidationError({"question_date": "The question date cannot be in the future."})
+        if attrs["action"] == "set_subject" and "subject" not in attrs:
+            raise serializers.ValidationError({"subject": "Required for this action."})
+        if attrs["action"] == "set_review_status" and "review_status" not in attrs:
+            raise serializers.ValidationError({"review_status": "Required for this action."})
         if attrs["action"] == "add_tags" and not attrs.get("tags"):
             raise serializers.ValidationError({"tags": "Required for this action."})
         return attrs
 
+
+
+class QuestionReportSerializer(serializers.ModelSerializer):
+    """What an admin sees in the reports queue."""
+
+    question_text = serializers.SerializerMethodField()
+    student_name = serializers.SerializerMethodField()
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+
+    class Meta:
+        model = QuestionReport
+        fields = [
+            "id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message", "status",
+            "admin_note", "resolved_at", "created_at",
+        ]
+        read_only_fields = ["id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message",
+                            "resolved_at", "created_at"]
+
+    def get_question_text(self, obj):
+        return obj.question.display_text[:200]
+
+    def get_student_name(self, obj):
+        s = obj.student
+        return (f"{s.first_name} {s.last_name}").strip() or s.username
+
+    def validate_status(self, value):
+        return value

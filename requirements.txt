@@ -9,6 +9,10 @@ openpyxl>=3.1
 xlrd>=2.0.1
 pypdf>=5
 reportlab>=4.2
-gunicorn
-whitenoise
+gunicorn>=23
+whitenoise>=6.9
+dj-database-url>=2.3
+psycopg[binary]>=3.2
+pymupdf>=1.24
+sentry-sdk>=2
 psycopg[binary]>=3.2,<4

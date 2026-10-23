@@ -62,16 +62,26 @@ class ExamCategorySerializer(serializers.ModelSerializer):
 
 class ExamQuestionReadSerializer(serializers.ModelSerializer):
     text = serializers.CharField(source="question.display_text", read_only=True)
+    question_date = serializers.DateField(source="question.question_date", read_only=True)
     subject_name = serializers.CharField(source="question.subject.name", read_only=True)
     difficulty = serializers.CharField(source="question.difficulty", read_only=True)
     is_active = serializers.BooleanField(source="question.is_active", read_only=True)
     current_version = serializers.IntegerField(source="question.version", read_only=True)
+    also_in = serializers.SerializerMethodField()
+
+    def get_also_in(self, obj):
+        """Titles of the other tests (not archived) that use this question."""
+        titles = {
+            i.section.exam.title for i in obj.question.exam_items.all()
+            if i.section.exam_id != obj.section.exam_id and i.section.exam.status != "archived"
+        }
+        return sorted(titles)
 
     class Meta:
         model = ExamQuestion
         fields = [
-            "id", "question", "text", "subject_name", "difficulty", "is_active", "order",
-            "marks", "negative_marks", "question_version", "current_version",
+            "id", "question", "text", "question_date", "subject_name", "difficulty", "is_active", "order",
+            "marks", "negative_marks", "question_version", "current_version", "also_in",
         ]
 
 
@@ -91,6 +101,8 @@ class ExamSerializer(serializers.ModelSerializer):
     thumbnail_url = serializers.SerializerMethodField()
     assigned_student_ids = serializers.PrimaryKeyRelatedField(source="assigned_students", many=True, read_only=True)
     assigned_batch_ids = serializers.PrimaryKeyRelatedField(source="assigned_batches", many=True, read_only=True)
+    premium_student_ids = serializers.PrimaryKeyRelatedField(source="premium_students", many=True, read_only=True)
+    premium_batch_ids = serializers.PrimaryKeyRelatedField(source="premium_batches", many=True, read_only=True)
     locked = serializers.SerializerMethodField()
 
     class Meta:
@@ -100,7 +112,7 @@ class ExamSerializer(serializers.ModelSerializer):
             "test_type", "subject", "subject_name", "year",
             "duration_minutes", "passing_marks", "marks_per_question", "negative_marking_enabled", "negative_mode", "negative_value",
             "unanswered_penalty", "sectional_timing", "shuffle_questions", "shuffle_options", "max_attempts", "start_at", "end_at",
-            "access_type", "assigned_student_ids", "assigned_batch_ids",
+            "access_type", "assigned_student_ids", "assigned_batch_ids", "is_premium", "price", "premium_student_ids", "premium_batch_ids",
             "status", "published_at", "version", "locked",
             "result_release", "result_release_at", "results_released",
             "solution_release", "solutions_released",
@@ -138,6 +150,11 @@ class ExamSerializer(serializers.ModelSerializer):
     def validate_marks_per_question(self, v):
         if v is not None and v <= 0:
             raise serializers.ValidationError("Marks per question must be greater than zero.")
+        return v
+
+    def validate_price(self, v):
+        if v is not None and v < 0:
+            raise serializers.ValidationError("The price cannot be negative.")
         return v
 
     def validate_passing_marks(self, v):

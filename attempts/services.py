@@ -16,10 +16,16 @@ GRACE_SECONDS = 5
 
 # --- visibility and eligibility -------------------------------------------------------------
 
-def visible_exams(user):
-    """Published tests this student is allowed to see."""
+def visible_exams(user, include_practice=False):
+    """
+    Published tests this student is allowed to see. Their own practice sets are left out of lists; pass
+    include_practice=True where one has to be opened or started.
+    """
+    base = Exam.objects.filter(status=Exam.Status.PUBLISHED)
+    if not include_practice:
+        base = base.filter(is_practice=False)
     return (
-        Exam.objects.filter(status=Exam.Status.PUBLISHED)
+        base
         .filter(
             Q(access_type=Exam.Access.PUBLIC)
             | Q(access_type=Exam.Access.ASSIGNED, assigned_students=user)
@@ -72,6 +78,18 @@ def solutions_visible(exam, now=None) -> bool:
     return exam.solutions_released
 
 
+def premium_entitlements(user) -> set[int]:
+    """Ids of the premium tests this student may start."""
+    ids = set(Exam.objects.filter(is_premium=True, premium_students=user).values_list("id", flat=True))
+    ids |= set(Exam.objects.filter(is_premium=True, premium_batches__students=user, premium_batches__is_active=True).values_list("id", flat=True))
+    ids |= set(Exam.objects.filter(is_premium=True, assigned_students=user).values_list("id", flat=True))
+    ids |= set(Exam.objects.filter(is_premium=True, assigned_batches__students=user, assigned_batches__is_active=True).values_list("id", flat=True))
+    return ids
+
+
+PREMIUM_MESSAGE = "This is a premium test. Ask your administrator for access."
+
+
 # --- starting -------------------------------------------------------------------------------
 
 class CannotStart(Exception):
@@ -83,7 +101,7 @@ def start_attempt(exam: Exam, user) -> tuple[Attempt, bool]:
     """Create the attempt or resume the active one. Safe to call repeatedly. Returns (attempt, created)."""
     try:
         with transaction.atomic():
-            if not visible_exams(user).filter(pk=exam.pk).exists():
+            if not visible_exams(user, include_practice=True).filter(pk=exam.pk).exists():
                 raise CannotStart("You are not eligible for this test.")
 
             now = timezone.now()
@@ -91,6 +109,8 @@ def start_attempt(exam: Exam, user) -> tuple[Attempt, bool]:
             active = Attempt.objects.filter(exam=exam, student=user, status=Attempt.Status.IN_PROGRESS).first()
             if active:
                 return active, False
+            if not exam.premium_allows(user):
+                raise CannotStart(PREMIUM_MESSAGE)
 
             status, can_start, reason = student_state(exam, user, now)
             if not can_start:
@@ -137,7 +157,7 @@ def start_attempt(exam: Exam, user) -> tuple[Attempt, bool]:
                         attempt=attempt, question=q, section_name=it.section.name,
                         section_order=it.section.order, order=order, subject_name=q.subject.name,
                         text=q.text, text_hi=q.text_hi, image_path=q.image.name if q.image else "", options=opts,
-                        explanation=q.explanation, explanation_hi=q.explanation_hi, marks=it.marks, negative_marks=it.negative_marks,
+                        explanation=q.explanation, explanation_hi=q.explanation_hi, video_url=q.video_url, marks=it.marks, negative_marks=it.negative_marks,
                     ))
                     order += 1
             AttemptQuestion.objects.bulk_create(rows)

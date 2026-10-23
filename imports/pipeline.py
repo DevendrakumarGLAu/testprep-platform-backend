@@ -3,6 +3,7 @@ The one pipeline every source goes through: raw rows -> normalised questions -> 
 duplicate detection -> (after review) persistence. CSV, Excel and PDF all end up as a table of
 raw rows, so a future website extractor only has to produce the same table.
 """
+import datetime
 import difflib
 import re
 from decimal import Decimal, InvalidOperation
@@ -23,19 +24,24 @@ SYNONYMS = {
     "question": ["question", "question text", "q", "text", "stem", "question statement"],
     "correct": ["correct answer", "correct", "answer", "ans", "right answer", "correct option", "key"],
     "explanation": ["explanation", "solution", "rationale", "explain", "answer explanation"],
+    "question_hi": ["question hi", "question hindi", "hindi question", "question text hi", "question text hindi", "प्रश्न"],
+    "explanation_hi": ["explanation hi", "explanation hindi", "hindi explanation", "solution hi", "solution hindi", "व्याख्या"],
     "subject": ["subject"],
     "topic": ["topic", "chapter"],
     "difficulty": ["difficulty", "level", "difficulty level"],
     "marks": ["marks", "positive marks", "score", "points", "mark"],
     "negative_marks": ["negative marks", "negative", "penalty", "negative marking", "negative mark"],
     "tags": ["tags", "tag", "labels", "keywords"],
+    "question_date": ["question date", "date", "event date", "dated", "current as of", "asked on"],
 }
 OPTION_HEADER = re.compile(r"(?:option|opt|choice)?\s*([a-j]|10|[1-9])")
+# 'option_a_hi', 'Option A Hindi', 'A hi': the Hindi text of an option.
+OPTION_HI_HEADER = re.compile(r"(?:option|opt|choice)?\s*([a-j]|10|[1-9])\s*(?:hi|hindi)")
 
 TEMPLATE_HEADERS = [
     "question", "option_a", "option_b", "option_c", "option_d", "option_e", "option_f",
     "correct_answer", "explanation", "subject", "topic", "difficulty", "marks", "negative_marks", "tags",
-]
+]  # Hindi columns (question_hi, option_a_hi ... explanation_hi) are recognised too; see guess_mapping
 TEMPLATE_EXAMPLE = [
     "What is the capital of France?", "Paris", "Rome", "Berlin", "Madrid", "", "",
     "A", "Paris has been the capital since 987.", "Geography", "Capitals", "easy", "1", "0.25", "europe;capitals",
@@ -49,6 +55,14 @@ def _key(h: str) -> str:
 def _option_rank(header: str):
     """'Option A', 'option_a', 'A', 'Choice 3' -> 0-based position; None if it is not an option column."""
     m = OPTION_HEADER.fullmatch(header.strip().lower().replace("_", " ").replace("-", " "))
+    if not m:
+        return None
+    t = m.group(1)
+    return LETTERS.index(t.upper()) if t.isalpha() else int(t) - 1
+
+
+def _option_hi_rank(header: str):
+    m = OPTION_HI_HEADER.fullmatch(header.strip().lower().replace("_", " ").replace("-", " "))
     if not m:
         return None
     t = m.group(1)
@@ -73,6 +87,8 @@ def guess_mapping(headers: list[str]) -> dict:
         if rank is not None and _key(h) not in sum(SYNONYMS.values(), []):
             opts.append((rank, h))
     mapping["options"] = [h for _, h in sorted(opts)][:MAX_OPTIONS]
+    hi = sorted((r, h) for h in headers if (r := _option_hi_rank(h)) is not None)
+    mapping["options_hi"] = [h for _, h in hi][:MAX_OPTIONS]
     return mapping
 
 
@@ -92,23 +108,50 @@ def _dec(value, default, field, errors, allow_negative_sign=False):
     return d
 
 
+_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y")
+
+
+def parse_date(value: str):
+    """A date from a cell: ISO, day/month/year, or '8 Jul 2026'. A time after the date (Excel) is ignored."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if re.match(r"\d{4}-\d{2}-\d{2}[ T]", value):
+        value = value[:10]
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(value)
+
+
 def normalize_row(raw: dict, mapping: dict, defaults: dict, ctx: "Lookup", create_missing: bool):
     errors: list[str] = []
     cell = lambda h: str(raw.get(h, "") if h else "").strip()  # noqa: E731
 
     text = cell(mapping.get("question"))
-    if not text:
-        errors.append("Question text is missing.")
+    text_hi = cell(mapping.get("question_hi"))
+    if not text and not text_hi:
+        errors.append("Question text is missing (English or Hindi).")
 
-    options = []
-    for i, h in enumerate(mapping.get("options", [])[:MAX_OPTIONS]):
-        t = cell(h)
-        if t:
-            options.append({"label": LETTERS[i], "text": t})
+    en_cells = [cell(h) for h in mapping.get("options", [])[:MAX_OPTIONS]]
+    hi_cells = [cell(h) for h in mapping.get("options_hi", [])[:MAX_OPTIONS]]
+    size = max(len(en_cells), len(hi_cells))
+    en_cells += [""] * (size - len(en_cells))
+    hi_cells += [""] * (size - len(hi_cells))
+    options = [
+        {"label": LETTERS[i], "text": en_cells[i], "text_hi": hi_cells[i]} for i in range(size) if en_cells[i] or hi_cells[i]
+    ]
     if len(options) < 2:
         errors.append("At least two options are required.")
-    if len({o["text"].lower() for o in options}) != len(options):
-        errors.append("Option texts must be unique.")
+    # A language that is started has to be finished: the question and every option.
+    for field, stem, name in (("text", text, "English"), ("text_hi", text_hi, "Hindi")):
+        filled = [bool(o[field]) for o in options]
+        if (stem or any(filled)) and not (stem and all(filled)):
+            errors.append(f"The {name} version is incomplete: it needs the question and every option.")
+        if len({o[field].lower() for o in options if o[field]}) != sum(filled):
+            errors.append(f"{name} option texts must be unique.")
 
     correct_raw = cell(mapping.get("correct"))
     correct_label = None
@@ -122,7 +165,7 @@ def normalize_row(raw: dict, mapping: dict, defaults: dict, ctx: "Lookup", creat
         elif re.fullmatch(r"\d{1,2}", up) and 1 <= int(up) <= MAX_OPTIONS and LETTERS[int(up) - 1] in labels:
             correct_label = LETTERS[int(up) - 1]
         else:
-            hits = [o["label"] for o in options if o["text"].lower() == correct_raw.lower()]
+            hits = [o["label"] for o in options if correct_raw.lower() in (o["text"].lower(), o["text_hi"].lower())]
             if len(hits) == 1:
                 correct_label = hits[0]
         if correct_label is None:
@@ -168,14 +211,25 @@ def normalize_row(raw: dict, mapping: dict, defaults: dict, ctx: "Lookup", creat
         errors.append("Marks must be greater than zero.")
     neg = _dec(cell(mapping.get("negative_marks")), Decimal(str(defaults.get("negative_marks", 0))), "Negative marks", errors, True)
 
+    qdate = None
+    date_raw = cell(mapping.get("question_date"))
+    if date_raw:
+        try:
+            qdate = parse_date(date_raw)
+            if qdate and qdate > datetime.date.today():
+                errors.append(f"Date '{date_raw}' is in the future.")
+        except ValueError:
+            errors.append(f"Date '{date_raw}' is not valid. Use YYYY-MM-DD or DD/MM/YYYY.")
+
     tags = [t.strip().lower() for t in re.split(r"[,;|]", cell(mapping.get("tags"))) if t.strip()]
 
     normalized = {
-        "question": text, "options": options, "correct_label": correct_label,
-        "explanation": cell(mapping.get("explanation")), "subject": subject_name, "topic": topic_name,
+        "question": text, "question_hi": text_hi, "display": text or text_hi, "options": options, "correct_label": correct_label,
+        "explanation": cell(mapping.get("explanation")), "explanation_hi": cell(mapping.get("explanation_hi")), "subject": subject_name, "topic": topic_name,
         "subject_id": subject.id if subject else None, "topic_id": topic.id if topic else None,
         "new_subject": new_subject, "new_topic": new_topic, "difficulty": diff,
         "marks": str(marks), "negative_marks": str(neg), "tags": tags[:15],
+        "question_date": qdate.isoformat() if qdate else None,
     }
     return normalized, errors
 
@@ -188,9 +242,9 @@ class Lookup:
         self.topics = {(t.subject_id, t.name.lower()): t for t in Topic.objects.filter(is_active=True)}
         self.by_hash: dict[str, int] = {}
         self.by_subject: dict[int, list[tuple[int, str]]] = {}
-        for qid, h, sid, text in Question.objects.values_list("id", "text_hash", "subject_id", "text")[:20000]:
+        for qid, h, sid, text, text_hi in Question.objects.values_list("id", "text_hash", "subject_id", "text", "text_hi")[:20000]:
             self.by_hash.setdefault(h, qid)
-            self.by_subject.setdefault(sid, []).append((qid, normalize_text(text)))
+            self.by_subject.setdefault(sid, []).append((qid, normalize_text(text or text_hi)))
 
     def subject(self, name):
         return self.subjects.get((name or "").lower())
@@ -242,8 +296,8 @@ def process_job(job: ImportJob, mapping: dict, defaults: dict, create_missing: b
             row.status = ImportRow.State.INVALID
             invalid += 1
         else:
-            h = text_hash(normalized["question"])
-            found = ctx.find_duplicate(normalized["question"], normalized["subject_id"])
+            h = text_hash(normalized["display"])
+            found = ctx.find_duplicate(normalized["display"], normalized["subject_id"])
             if h in seen_in_file:
                 row.status = ImportRow.State.DUPLICATE
                 row.duplicate_info = {"in_file": True, "row": seen_in_file[h], "similarity": 1.0, "exact": True}
@@ -283,6 +337,9 @@ def commit_job(job: ImportJob, user) -> ImportJob:
 
     imported = failed = skipped = 0
     for row in job.rows.select_related("job"):
+        if row.result == ImportRow.Result.IMPORTED:
+            imported += 1  # an earlier attempt was cut off after this row; never import it twice
+            continue
         if row.status == ImportRow.State.INVALID or not row.selected:
             row.result, row.result_message = ImportRow.Result.SKIPPED, "Not selected." if row.status != ImportRow.State.INVALID else "Invalid row."
             row.save(update_fields=["result", "result_message"])
@@ -298,10 +355,14 @@ def commit_job(job: ImportJob, user) -> ImportJob:
                 if topic is None and n["new_topic"] and n["topic"]:
                     topic, _ = Topic.objects.get_or_create(subject=subject, name__iexact=n["topic"], defaults={"name": n["topic"]})
                 data = {
-                    "text": n["question"], "subject": subject.id, "topic": topic.id if topic else None,
+                    "text": n["question"], "text_hi": n.get("question_hi", ""), "explanation_hi": n.get("explanation_hi", ""),
+                    "subject": subject.id, "topic": topic.id if topic else None,
                     "difficulty": n["difficulty"], "marks": n["marks"], "negative_marks": n["negative_marks"],
-                    "explanation": n["explanation"], "tags": n["tags"], "allow_duplicate": True,
-                    "options": [{"text": o["text"], "is_correct": o["label"] == n["correct_label"]} for o in n["options"]],
+                    "explanation": n["explanation"], "tags": n["tags"], "allow_duplicate": True, "question_date": n.get("question_date"),
+                    "options": [
+                        {"text": o["text"], "text_hi": o.get("text_hi", ""), "is_correct": o["label"] == n["correct_label"]}
+                        for o in n["options"]
+                    ],
                 }
                 ser = QuestionSerializer(data=data)
                 ser.is_valid(raise_exception=True)
