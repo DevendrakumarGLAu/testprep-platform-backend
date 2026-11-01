@@ -23,6 +23,14 @@ class Attempt(models.Model):
     submitted_at = models.DateTimeField(null=True, blank=True)
     auto_submitted = models.BooleanField(default=False)
 
+    # Pausing. While paused_at is set the clock is stopped; on resume the deadline moves forward by the time paused.
+    paused_at = models.DateTimeField(null=True, blank=True)
+    paused_seconds = models.PositiveIntegerField(default=0)  # total time spent paused, left out of the time taken
+    pause_count = models.PositiveSmallIntegerField(default=0)
+    allow_pause = models.BooleanField(default=False)  # frozen at start, like the other rules
+    max_pauses = models.PositiveSmallIntegerField(default=0)  # 0 = unlimited
+    pause_minutes = models.PositiveSmallIntegerField(default=0)  # 0 = no limit
+
     # Rules frozen at start, so later exam edits cannot change this attempt.
     duration_minutes = models.PositiveIntegerField()
     total_marks = models.DecimalField(max_digits=10, decimal_places=2)

@@ -60,7 +60,7 @@ class PublicExamPage(APIView):
     def get(self, request, pid):
         category = get_object_or_404(ExamCategory.objects.prefetch_related("subjects"), public_id=pid, is_active=True)
         tests = (
-            Exam.objects.filter(category=category, status=Exam.Status.PUBLISHED, access_type=Exam.Access.PUBLIC, is_practice=False)
+            Exam.objects.in_category(category).filter(status=Exam.Status.PUBLISHED, access_type=Exam.Access.PUBLIC, is_practice=False)
             .with_totals().order_by("test_type", "title")
         )
         response = Response({
@@ -74,3 +74,4 @@ class PublicExamPage(APIView):
         })
         response["Cache-Control"] = "public, max-age=300"
         return response
+

@@ -3,6 +3,20 @@ import re
 
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
+
+from core.media import unique_upload_path
+
+
+def question_image_path(instance, filename):
+    """Every uploaded question image gets its own random name (questions/<random>.png)."""
+    return unique_upload_path("questions", filename)
+
+
+def report_image_path(instance, filename):
+    """A picture a student attached to a report gets its own random name (reports/<random>.png)."""
+    return unique_upload_path("reports", filename)
 
 
 def normalize_text(text: str) -> str:
@@ -97,7 +111,7 @@ class Question(models.Model):
     # tests to recent material. Not the same as created_at, which is when the row was typed in.
     question_date = models.DateField(null=True, blank=True, db_index=True)
     tags = models.ManyToManyField(Tag, blank=True, related_name="questions")
-    image = models.ImageField(upload_to="questions/", null=True, blank=True)
+    image = models.ImageField(upload_to=question_image_path, null=True, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     # Set to needs_review when a student reports a problem; a test cannot be published while it holds such a question.
     review_status = models.CharField(max_length=14, choices=ReviewStatus.choices, default=ReviewStatus.APPROVED, db_index=True)
@@ -159,6 +173,8 @@ class QuestionReport(models.Model):
     exam_title = models.CharField(max_length=200, blank=True)
     reason = models.CharField(max_length=16, choices=Reason.choices)
     message = models.TextField(blank=True)
+    # A screenshot or photo the student attached, to show what is wrong.
+    image = models.ImageField(upload_to=report_image_path, null=True, blank=True)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
     admin_note = models.TextField(blank=True)
     resolved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
@@ -171,3 +187,10 @@ class QuestionReport(models.Model):
             # One open report per student per question: a second one updates the first.
             models.UniqueConstraint(fields=["question", "student"], condition=models.Q(status="open"), name="one_open_report_per_student"),
         ]
+
+
+@receiver(post_delete, sender=QuestionReport)
+def delete_report_picture(sender, instance, **kwargs):
+    """A picture belongs to its report alone, so it goes when the report does."""
+    if instance.image:
+        instance.image.storage.delete(instance.image.name)

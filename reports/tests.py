@@ -267,3 +267,23 @@ class PdfReportTests(ReportBase):
         r = self.client.get("/api/students/?format=csv")
         self.assertNotIn("text/csv", r["Content-Type"])
         self.assertIn("json", r["Content-Type"])
+
+
+class ParticipationDaysTests(ReportBase):
+    """The chart counts the platform's own (India) days, also in the hours after midnight when the UTC date is still yesterday."""
+
+    def test_an_attempt_just_after_midnight_india_time_is_on_todays_bar(self):
+        from datetime import datetime
+        from unittest.mock import patch
+        from zoneinfo import ZoneInfo
+
+        from attempts.models import Attempt
+
+        late = datetime(2026, 10, 31, 0, 20, tzinfo=ZoneInfo("Asia/Kolkata"))  # 18:50 UTC on 30 October
+        a = self.attempt(self.alice)
+        Attempt.objects.filter(pk=a.pk).update(submitted_at=late)
+        with patch("django.utils.timezone.now", return_value=late):
+            d = self.client.get("/api/admin/dashboard/").data
+        self.assertEqual(len(d["participation"]), 14)
+        self.assertEqual(d["participation"][-1], {"date": "2026-10-31", "attempts": 1})
+        self.assertEqual(d["participation"][-2]["attempts"], 0)

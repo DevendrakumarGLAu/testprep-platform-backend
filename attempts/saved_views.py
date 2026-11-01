@@ -2,10 +2,12 @@
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsStudent
+from core.media import media_url, prepare_image
 from questionbank.models import QuestionReport
 
 from . import services as svc
@@ -13,6 +15,7 @@ from .models import Attempt, AttemptQuestion, SavedQuestion
 from .views import own_attempt
 
 NOTE_MAX = 1000
+MAX_REPORT_IMAGE_BYTES = 2 * 1024 * 1024
 
 
 def _review_question(request, pid, number) -> tuple[Attempt, AttemptQuestion]:
@@ -96,9 +99,13 @@ class SavedDetail(APIView):
 
 
 class ReportQuestion(APIView):
-    """POST {reason, message}: tell the admins that question `number` of this attempt is wrong."""
+    """
+    POST {reason, message, image?}: tell the admins that question `number` of this attempt is wrong. A picture can be attached (send the
+    request as a form); sending the report again replaces the message, and the picture only if a new one is sent.
+    """
 
     permission_classes = [IsStudent]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def post(self, request, pid, number):
         attempt, aq = _review_question(request, pid, number)
@@ -108,6 +115,14 @@ class ReportQuestion(APIView):
         if reason not in QuestionReport.Reason.values:
             raise serializers.ValidationError({"reason": "Choose what is wrong."})
         message = _clean_text(request, "message", required=reason == "other", minimum=5)
+        picture = None
+        upload = request.FILES.get("image")
+        if upload:
+            if upload.size > MAX_REPORT_IMAGE_BYTES:
+                raise serializers.ValidationError({"image": "The picture must be 2 MB or smaller."})
+            if not (upload.content_type or "").startswith("image/"):
+                raise serializers.ValidationError({"image": "The file must be a picture."})
+            picture = prepare_image(upload)
         with transaction.atomic():
             try:
                 report, created = QuestionReport.objects.update_or_create(
@@ -121,7 +136,16 @@ class ReportQuestion(APIView):
             if q.review_status != "needs_review":
                 q.review_status = "needs_review"  # keep it out of newly published tests until an admin has looked
                 q.save(update_fields=["review_status", "updated_at"])
-        return Response({"id": report.id, "status": report.status, "updated": not created}, status=201 if created else 200)
+        if picture is not None:
+            old = report.image.name if report.image else ""
+            report.image = picture
+            report.save(update_fields=["image"])
+            if old and old != report.image.name:
+                report.image.storage.delete(old)  # a report's picture is its own, so the replaced one can go
+        return Response(
+            {"id": report.id, "status": report.status, "updated": not created, "image_url": media_url(request, report.image.name if report.image else None)},
+            status=201 if created else 200,
+        )
 
 
 class MyReports(APIView):
@@ -134,7 +158,7 @@ class MyReports(APIView):
         return Response({"results": [
             {"id": r.id, "question": r.question.display_text[:160], "exam_title": r.exam_title, "reason": r.get_reason_display(),
              "message": r.message, "status": r.status, "status_label": r.get_status_display(), "admin_note": r.admin_note,
-             "created_at": r.created_at, "resolved_at": r.resolved_at}
+             "image_url": media_url(request, r.image.name if r.image else None), "created_at": r.created_at, "resolved_at": r.resolved_at}
             for r in rows
         ]})
 

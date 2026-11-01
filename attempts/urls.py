@@ -19,6 +19,7 @@ urlpatterns = [
     path("attempts/<str:pid>/questions/<int:number>/save/", saved_views.SaveQuestion.as_view()),
     path("attempts/<str:pid>/questions/<int:number>/report/", saved_views.ReportQuestion.as_view()),
     path("exams/", views.StudentExamList.as_view()),
+    path("live/<str:pid>/", views.StudentLiveExam.as_view()),
     path("exams/<str:pid>/", views.StudentExamDetail.as_view()),
     path("exams/<str:pid>/start/", views.StartAttempt.as_view()),
     path("exams/<str:pid>/leaderboard/", leaderboard.Leaderboard.as_view()),
@@ -27,5 +28,7 @@ urlpatterns = [
     path("attempts/<str:pid>/answers/", views.SaveAnswers.as_view()),
     path("attempts/<str:pid>/result/", views.AttemptResult.as_view()),
     path("attempts/<str:pid>/submit/", views.SubmitAttempt.as_view()),
+    path("attempts/<str:pid>/pause/", views.PauseAttempt.as_view()),
+    path("attempts/<str:pid>/resume/", views.ResumeAttempt.as_view()),
     path("attempts/<str:pid>/sections/submit/", views.SubmitSection.as_view()),
 ]

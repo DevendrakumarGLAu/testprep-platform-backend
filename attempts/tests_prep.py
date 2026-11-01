@@ -107,7 +107,7 @@ class ChooseExamTests(PrepBase):
         self.assertEqual([e["name"] for e in d["exams"]], ["SSC"])  # Banking has no tests yet
         ssc = d["exams"][0]
         self.assertEqual(ssc["subjects"], ["English", "GK", "Maths", "Reasoning"])
-        self.assertEqual(ssc["counts"], {"full_test": 2, "sectional": 2, "previous_year": 2, "total": 6})
+        self.assertEqual(ssc["counts"], {"full_test": 2, "mini_mock": 0, "sectional": 2, "previous_year": 2, "total": 6})
         self.assertFalse(ssc["preparing"])
         self.assertEqual(d["preparing"], [])
 
@@ -222,7 +222,7 @@ class HubTests(PrepBase):
         aid = self.client.post(f"/api/student/exams/{card['id']}/start/").data["attempt_id"]
         self.client.post(f"/api/student/attempts/{aid}/submit/")
         p = self.client.get("/api/student/dashboard/").data["preparing"]
-        self.assertEqual(p, [{"id": self.ssc.public_id, "name": "SSC", "total_tests": 6, "attempted_tests": 1}])
+        self.assertEqual(p, [{"id": self.ssc.public_id, "name": "SSC", "total_tests": 6, "attempted_tests": 1, "group": None}])
 
     def test_existing_list_can_filter_by_type_and_category(self):
         self.build_ssc()

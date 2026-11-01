@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from django.conf import settings
 
+from core.media import media_url
 from core.numbers import money
 
 from .models import Attempt
@@ -14,9 +15,7 @@ def _pct(score, total) -> float | None:
 
 
 def _image(request, path):
-    if not path:
-        return None
-    return request.build_absolute_uri("/" + settings.MEDIA_URL.strip("/") + "/" + path)
+    return media_url(request, path)
 
 
 def exam_average_percentage(exam) -> dict:
@@ -126,6 +125,7 @@ def build_result(attempt: Attempt, request, reveal_solutions: bool, include_stud
         "timing": timing,
         "comparison": exam_average_percentage(attempt.exam),
         "solutions_available": reveal_solutions,
+        "reattempt_enabled": settings.REATTEMPT_ENABLED,
         "questions": questions,
     }
     if include_student:

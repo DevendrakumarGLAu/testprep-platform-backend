@@ -14,6 +14,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from accounts.models import log_activity
+from core.media import prepare_image, remove_question_image
 from notifications import services as notifications
 from notifications.models import Notification
 from accounts.permissions import IsAdminOrSuperAdmin
@@ -200,8 +201,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
     def image(self, request, pk=None):
         q = self.get_object()
         if request.method == "DELETE":
-            if q.image:
-                q.image.delete(save=True)
+            remove_question_image(q)
+            q.image = None
+            q.save(update_fields=["image"])
             return Response(self.get_serializer(q).data)
         f = request.FILES.get("image")
         if not f:
@@ -210,14 +212,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
             raise serializers.ValidationError({"image": "Image must be 2 MB or smaller."})
         if not (f.content_type or "").startswith("image/"):
             raise serializers.ValidationError({"image": "File must be an image."})
-        try:
-            Image.open(f).verify()  # reject files that only claim to be images
-        except Exception:
-            raise serializers.ValidationError({"image": "Upload a valid image file."})
-        f.seek(0)
-        if q.image:
-            q.image.delete(save=False)
-        q.image = f
+        stored = prepare_image(f)
+        remove_question_image(q)
+        q.image = stored
         q.save()
         return Response(self.get_serializer(q).data)
 

@@ -188,3 +188,72 @@ class AdminReportQueueTests(ReviewBase):
         flagged.save()
         self.assertEqual(self.client.post(f"/api/exams/{draft.id}/publish/").status_code, 200)
         self.assertEqual(Exam.objects.get(pk=draft.id).status, "published")
+
+
+from django.core.files.storage import InMemoryStorage  # noqa: E402
+from django.test import override_settings  # noqa: E402
+
+from core.tests_media import CLOUD, FakeCloud, picture  # noqa: E402,F401
+
+
+@override_settings(STORAGES=CLOUD)
+class ReportPictureTests(ReviewBase):
+    def report(self, n=1, **extra):
+        return self.client.post(self.url(n, "report"), {"reason": "wrong_question", "message": "see the picture", **extra}, format="multipart")
+
+    def test_a_picture_can_be_attached_and_comes_back_as_an_address(self):
+        r = self.report(image=picture())
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertRegex(r.data["image_url"], r"^https://cdn\.example/storage/reports/[0-9a-f]{32}\.png$")
+        self.assertTrue(QuestionReport.objects.get().image)
+
+    def test_a_report_without_a_picture_still_works_and_has_no_address(self):
+        r = self.client.post(self.url(1, "report"), {"reason": "typo"}, format="json")
+        self.assertEqual(r.status_code, 201)
+        self.assertIsNone(r.data["image_url"])
+
+    def test_the_student_and_the_admin_both_see_the_picture(self):
+        url = self.report(image=picture()).data["image_url"]
+        self.assertEqual(self.client.get("/api/student/reports/").data["results"][0]["image_url"], url)
+        self.client.force_authenticate(self.admin)
+        rows = self.client.get("/api/question-reports/").data
+        rows = rows["results"] if isinstance(rows, dict) else rows
+        self.assertEqual(rows[0]["image_url"], url)
+
+    def test_only_pictures_are_accepted(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        r = self.report(image=SimpleUploadedFile("x.txt", b"hello", content_type="text/plain"))
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(QuestionReport.objects.count(), 0)
+
+    def test_a_picture_over_2_mb_is_refused(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        r = self.report(image=SimpleUploadedFile("big.png", b"0" * (2 * 1024 * 1024 + 1), content_type="image/png"))
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(QuestionReport.objects.count(), 0)
+
+    def test_sending_again_without_a_picture_keeps_it_and_with_one_replaces_it(self):
+        first = self.report(image=picture()).data["image_url"]
+        again = self.client.post(self.url(1, "report"), {"reason": "typo"}, format="json")
+        self.assertEqual(again.data["image_url"], first)
+        second = self.report(image=picture(name="two")).data["image_url"]
+        self.assertNotEqual(second, first)
+        self.assertEqual(QuestionReport.objects.count(), 1)
+        from django.core.files.storage import storages
+        self.assertFalse(storages["default"].exists(first.rsplit("/storage/", 1)[1]))
+
+    def test_deleting_a_report_removes_its_picture(self):
+        from django.core.files.storage import storages
+        name = self.report(image=picture()).data["image_url"].rsplit("/storage/", 1)[1]
+        self.assertTrue(storages["default"].exists(name))
+        QuestionReport.objects.get().delete()
+        self.assertFalse(storages["default"].exists(name))
+
+
+class ReattemptSettingTests(ReviewBase):
+    def test_the_result_says_the_reattempt_button_is_on_by_default(self):
+        self.assertIs(self.client.get(f"/api/student/attempts/{self.a}/result/").data["reattempt_enabled"], True)
+
+    def test_the_env_setting_switches_it_off_without_any_code_change(self):
+        with override_settings(REATTEMPT_ENABLED=False):
+            self.assertIs(self.client.get(f"/api/student/attempts/{self.a}/result/").data["reattempt_enabled"], False)

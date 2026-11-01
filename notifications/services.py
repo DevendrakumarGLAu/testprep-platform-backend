@@ -32,8 +32,9 @@ def students_for_exam(exam: Exam):
         return active.filter(assigned_exams=exam)
     if exam.access_type == Exam.Access.BATCH:
         return active.filter(student_batches__in=exam.assigned_batches.filter(is_active=True)).distinct()
-    if exam.category_id:
-        return active.filter(preparations__category_id=exam.category_id).distinct()
+    exams = [i for i in [exam.category_id, *exam.also_in.values_list("id", flat=True)] if i]  # its own exam and the ones sharing it
+    if exams:
+        return active.filter(preparations__category_id__in=exams).distinct()
     return active.none()
 
 

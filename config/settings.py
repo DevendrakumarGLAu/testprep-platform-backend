@@ -7,6 +7,8 @@ from django.core.exceptions import ImproperlyConfigured
 import dj_database_url
 from dotenv import load_dotenv
 
+from .storage import build_storages
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -130,7 +132,13 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
+# Question images and test thumbnails: Supabase Storage when SUPABASE_S3_ENDPOINT is set (production), the local media folder otherwise.
+STORAGES = build_storages(os.environ)
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Re-attempt button under each question on a student's result page. Set REATTEMPT_ENABLED=false to switch it off without a code change.
+REATTEMPT_ENABLED = env_bool("REATTEMPT_ENABLED", True)
+
 
 # Email (password reset and email verification). Set EMAIL_HOST (and the user, password, port) to use a real email service such as
 # Gmail, Brevo or SES. Without it, emails are only printed in the server log and the app tells people to ask an administrator.
@@ -170,7 +178,7 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=3600),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     # Every refresh issues a new refresh token and retires the old one, so a stolen token has one use at most.
     "ROTATE_REFRESH_TOKENS": True,

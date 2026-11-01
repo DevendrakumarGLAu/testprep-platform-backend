@@ -15,4 +15,5 @@ dj-database-url>=2.3
 psycopg[binary]>=3.2
 pymupdf>=1.24
 sentry-sdk>=2
-psycopg[binary]>=3.2,<4
+django-storages[s3]>=1.14
+boto3>=1.34

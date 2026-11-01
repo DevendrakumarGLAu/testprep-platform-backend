@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
@@ -9,14 +10,15 @@ from questionbank.models import Question
 
 from questionbank.models import Subject
 
-from .models import Batch, Exam, ExamCategory, ExamQuestion, ExamSection
+from .tabs import LABEL_MAX, MAX_TABS, TAB_KEYS, custom_keys, is_custom, resolve_tabs
+from .models import Batch, Exam, ExamCategory, ExamGroup, ExamQuestion, ExamSection
 
 MAX_QUESTIONS_PER_TEST = 300
 
 # Fields that define how an exam is taken or scored. Frozen once the exam leaves draft.
 LOCKED_WHEN_PUBLISHED = (
     "duration_minutes", "passing_marks", "marks_per_question", "negative_marking_enabled", "negative_mode", "negative_value", "unanswered_penalty",
-    "sectional_timing", "shuffle_questions", "shuffle_options", "max_attempts", "access_type",
+    "sectional_timing", "shuffle_questions", "shuffle_options", "max_attempts", "access_type", "is_live", "late_join_minutes",
 )
 
 
@@ -38,17 +40,132 @@ class BatchSerializer(serializers.ModelSerializer):
         return value
 
 
+NEGATIVE_OPTIONS = ("off", "question", "fraction", "fixed")
+
+
+def clean_pattern(value) -> dict:
+    """Checks an exam's pattern and keeps only the settings we know. An empty pattern means "none saved"."""
+    if value in (None, "", {}):
+        return {}
+    if not isinstance(value, dict):
+        raise serializers.ValidationError("The pattern must be a set of settings.")
+
+    def number(key, low, high, whole=False):
+        raw = value.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            n = Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            raise serializers.ValidationError({key: "Enter a number."})
+        if not Decimal(str(low)) <= n <= Decimal(str(high)) or (whole and n != n.to_integral_value()):
+            raise serializers.ValidationError({key: f"Enter {'a whole number' if whole else 'a number'} from {low} to {high}."})
+        return int(n) if whole else float(n)
+
+    out = {}
+    for key, low, high, whole in (
+        ("duration_minutes", 1, 600, True), ("marks_per_question", 0.01, 100, False),
+        ("passing_marks", 0, 10000, False), ("negative_value", 0, 100, False), ("max_attempts", 0, 50, True),
+    ):
+        n = number(key, low, high, whole)
+        if n is not None:
+            out[key] = n
+    option = value.get("negative_option")
+    if option not in (None, ""):
+        if option not in NEGATIVE_OPTIONS:
+            raise serializers.ValidationError({"negative_option": "Choose off, per question, a fraction or a fixed mark."})
+        out["negative_option"] = option
+    if "sectional_timing" in value:
+        out["sectional_timing"] = bool(value["sectional_timing"])
+    sections = value.get("sections") or []
+    if not isinstance(sections, list) or len(sections) > 30:
+        raise serializers.ValidationError({"sections": "Send up to 30 sections."})
+    cleaned = []
+    for sec in sections:
+        name = str(sec.get("name", "")).strip() if isinstance(sec, dict) else ""
+        if not name or len(name) > 120:
+            raise serializers.ValidationError({"sections": "Every section needs a name of up to 120 characters."})
+        minutes = sec.get("duration_minutes")
+        if minutes in (None, ""):
+            minutes = None
+        else:
+            try:
+                minutes = int(minutes)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({"sections": "Section minutes must be a whole number."})
+            if not 1 <= minutes <= 600:
+                raise serializers.ValidationError({"sections": "Section minutes must be between 1 and 600."})
+        cleaned.append({"name": name, "duration_minutes": minutes})
+    if cleaned:
+        out["sections"] = cleaned
+    return out
+
+
+class ExamGroupSerializer(serializers.ModelSerializer):
+    exam_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = ExamGroup
+        fields = ["id", "public_id", "name", "description", "order", "is_active", "exam_count"]
+        read_only_fields = ["id", "public_id"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        qs = ExamGroup.objects.filter(name__iexact=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("A family with this name already exists.")
+        return value
+
+
 class ExamCategorySerializer(serializers.ModelSerializer):
     exam_count = serializers.IntegerField(read_only=True)
     subjects = serializers.PrimaryKeyRelatedField(many=True, queryset=Subject.objects.all(), required=False)
     subject_names = serializers.SerializerMethodField()
+    group = serializers.PrimaryKeyRelatedField(queryset=ExamGroup.objects.all(), required=False, allow_null=True)
+    group_name = serializers.CharField(source="group.name", read_only=True, default=None)
+    pattern = serializers.JSONField(required=False)
+    tabs = serializers.JSONField(required=False)
 
     class Meta:
         model = ExamCategory
-        fields = ["id", "name", "description", "subjects", "subject_names", "is_active", "exam_count"]
+        fields = ["id", "name", "description", "subjects", "subject_names", "group", "group_name", "pattern", "tabs", "is_active", "exam_count"]
 
     def get_subject_names(self, obj):
         return [s.name for s in obj.subjects.all()]
+
+    def validate_pattern(self, value):
+        return clean_pattern(value)
+
+    def validate_tabs(self, value):
+        """A list of {key, label, visible}: the four built-in tabs plus any of the admin's own. At least one tab must show."""
+        if value in (None, "", []):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Send the tabs as a list.")
+        seen = set()
+        for item in value:
+            if not isinstance(item, dict) or not (item.get("key") in TAB_KEYS or is_custom(item.get("key"))):
+                raise serializers.ValidationError("Unknown tab.")
+            if item["key"] in seen:
+                raise serializers.ValidationError("A tab is listed twice.")
+            seen.add(item["key"])
+            label = str(item.get("label") or "").strip()
+            if len(label) > LABEL_MAX:
+                raise serializers.ValidationError(f"A tab name can be at most {LABEL_MAX} characters.")
+            if is_custom(item["key"]) and not label:
+                raise serializers.ValidationError("Give every new tab a name.")
+        if len(resolve_tabs(value)) > MAX_TABS:
+            raise serializers.ValidationError(f"An exam can have at most {MAX_TABS} tabs.")
+        if not any(item.get("visible") is not False for item in value):
+            raise serializers.ValidationError("At least one tab must be shown.")
+        return resolve_tabs(value)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["tabs"] = resolve_tabs(instance.tabs)  # always the four, in order, so the admin screen can show them all
+        return data
 
     def validate_name(self, value):
         value = value.strip()
@@ -104,14 +221,17 @@ class ExamSerializer(serializers.ModelSerializer):
     premium_student_ids = serializers.PrimaryKeyRelatedField(source="premium_students", many=True, read_only=True)
     premium_batch_ids = serializers.PrimaryKeyRelatedField(source="premium_batches", many=True, read_only=True)
     locked = serializers.SerializerMethodField()
+    # Other exams that also show this test. Its own exam (category) is left out of the list automatically.
+    also_in = serializers.PrimaryKeyRelatedField(many=True, queryset=ExamCategory.objects.all(), required=False)
 
     class Meta:
         model = Exam
         fields = [
-            "id", "public_id", "title", "description", "instructions", "category", "category_name", "thumbnail_url",
-            "test_type", "subject", "subject_name", "year",
+            "id", "public_id", "title", "description", "instructions", "category", "category_name", "also_in", "thumbnail_url",
+            "test_type", "tab_key", "subject", "subject_name", "year",
             "duration_minutes", "passing_marks", "marks_per_question", "negative_marking_enabled", "negative_mode", "negative_value",
             "unanswered_penalty", "sectional_timing", "shuffle_questions", "shuffle_options", "max_attempts", "start_at", "end_at",
+            "allow_pause", "max_pauses", "pause_minutes", "is_live", "late_join_minutes",
             "access_type", "assigned_student_ids", "assigned_batch_ids", "is_premium", "price", "premium_student_ids", "premium_batch_ids",
             "status", "published_at", "version", "locked",
             "result_release", "result_release_at", "results_released",
@@ -171,6 +291,10 @@ class ExamSerializer(serializers.ModelSerializer):
         inst = self.instance
         get = lambda k: attrs.get(k, getattr(inst, k, None))  # noqa: E731
 
+        if "also_in" in attrs:
+            own = attrs["category"] if "category" in attrs else (inst.category if inst else None)
+            attrs["also_in"] = [c for c in attrs["also_in"] if c != own]
+
         if inst and inst.status == Exam.Status.ARCHIVED:
             raise serializers.ValidationError("Archived tests cannot be edited. Restore it first.")
         if inst and inst.status != Exam.Status.DRAFT:
@@ -193,6 +317,13 @@ class ExamSerializer(serializers.ModelSerializer):
         else:
             attrs["year"] = None
 
+        tab_key = (get("tab_key") or "").strip()
+        if tab_key:
+            category = attrs["category"] if "category" in attrs else (inst.category if inst else None)
+            if category is None or tab_key not in custom_keys(category.tabs):
+                raise serializers.ValidationError({"tab_key": "Choose one of this exam's own tabs, or leave it empty."})
+        attrs["tab_key"] = tab_key
+
         mode, value = get("negative_mode") or Exam.NegativeMode.QUESTION, get("negative_value")
         value = Decimal("0") if value is None else Decimal(value)
         if mode == Exam.NegativeMode.FRACTION and not Decimal("0") < value <= Decimal("1"):
@@ -201,6 +332,14 @@ class ExamSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"negative_value": "Enter the marks deducted per wrong answer (0 or more)."})
         if mode == Exam.NegativeMode.QUESTION:
             attrs["negative_value"] = Decimal("0")  # not used; keep the stored value tidy
+
+        if get("is_live"):
+            start = get("start_at")
+            if not start:
+                raise serializers.ValidationError({"start_at": "A live test needs a start time."})
+            # Everyone ends together, so the end of the window is simply start + duration; it is worked out, not typed.
+            attrs["end_at"] = start + timedelta(minutes=get("duration_minutes") or 0)
+            attrs["allow_pause"] = False  # a pause would give some students more time than others
 
         start, end = get("start_at"), get("end_at")
         if start and end and end <= start:

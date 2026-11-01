@@ -2,6 +2,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
+from core.media import media_url
 from .models import QuestionReport, Question, QuestionOption, Subject, Tag, Topic, text_hash
 
 MIN_OPTIONS, MAX_OPTIONS = 2, 10
@@ -284,18 +285,22 @@ class QuestionReportSerializer(serializers.ModelSerializer):
     question_text = serializers.SerializerMethodField()
     student_name = serializers.SerializerMethodField()
     reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = QuestionReport
         fields = [
-            "id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message", "status",
+            "id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message", "image_url", "status",
             "admin_note", "resolved_at", "created_at",
         ]
-        read_only_fields = ["id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message",
+        read_only_fields = ["id", "question", "question_text", "student_name", "exam_title", "reason", "reason_label", "message", "image_url",
                             "resolved_at", "created_at"]
 
     def get_question_text(self, obj):
         return obj.question.display_text[:200]
+
+    def get_image_url(self, obj):
+        return media_url(self.context.get("request"), obj.image.name) if obj.image else None
 
     def get_student_name(self, obj):
         s = obj.student

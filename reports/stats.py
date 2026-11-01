@@ -112,7 +112,9 @@ def dashboard() -> dict:
     students = User.objects.filter(role=Role.STUDENT)
     done = Attempt.objects.filter(status=SUBMITTED, exam__is_practice=False)  # practice sets are the students' own
 
-    days = [(now - timedelta(days=i)).date() for i in range(13, -1, -1)]
+    # Days are the platform's own (India) days, the same ones TruncDate groups by; the UTC date is a day behind until 5:30 am.
+    today = timezone.localdate()
+    days = [today - timedelta(days=i) for i in range(13, -1, -1)]
     by_day = dict(
         done.filter(submitted_at__date__gte=days[0])
         .annotate(d=TruncDate("submitted_at"))

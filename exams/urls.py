@@ -6,6 +6,7 @@ from .public import PublicExamPage, PublicHome
 
 router = DefaultRouter()
 router.register("batches", views.BatchViewSet, basename="batch")
+router.register("exam-groups", views.ExamGroupViewSet, basename="exam-group")
 router.register("exam-categories", views.ExamCategoryViewSet, basename="exam-category")
 router.register("exams", views.ExamViewSet, basename="exam")
 

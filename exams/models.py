@@ -1,11 +1,18 @@
 from decimal import Decimal
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import Count, IntegerField, OuterRef, Subquery, Sum
+from django.db.models import Count, IntegerField, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 
 from core.ids import new_public_id
+from core.media import unique_upload_path
+
+
+def exam_thumbnail_path(instance, filename):
+    """Every uploaded thumbnail gets its own random name (exams/<random>.png)."""
+    return unique_upload_path("exams", filename)
 
 
 class Batch(models.Model):
@@ -25,6 +32,22 @@ class Batch(models.Model):
         return self.name
 
 
+class ExamGroup(models.Model):
+    """A family of exams that students think of together, for example SSC (MTS, CHSL, CGL) or Railways (NTPC, Group D)."""
+
+    public_id = models.CharField(max_length=24, unique=True, editable=False, default=new_public_id)
+    name = models.CharField(max_length=120, unique=True)
+    description = models.TextField(blank=True)
+    order = models.PositiveIntegerField(default=0)  # lower comes first; ties by name
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
 class ExamCategory(models.Model):
     """What a student prepares for, for example SSC. Its subjects are the sections of that exam."""
 
@@ -33,6 +56,13 @@ class ExamCategory(models.Model):
     name = models.CharField(max_length=120, unique=True)
     description = models.TextField(blank=True)
     subjects = models.ManyToManyField("questionbank.Subject", blank=True, related_name="exam_categories")
+    # The family this exam belongs to (SSC for SSC CGL). Optional, so older exams keep working on their own.
+    group = models.ForeignKey(ExamGroup, null=True, blank=True, on_delete=models.SET_NULL, related_name="categories")
+    # This exam's usual pattern, used to fill in a new test: duration_minutes, marks_per_question, passing_marks,
+    # negative_option / negative_value, sectional_timing, sections [{name, duration_minutes}], max_attempts.
+    pattern = models.JSONField(default=dict, blank=True)
+    # The tabs students see inside this exam: [{key, label, visible}] in order. Empty means the four standard tabs. See exams/tabs.py.
+    tabs = models.JSONField(default=list, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -44,6 +74,10 @@ class ExamCategory(models.Model):
 
 
 class ExamQuerySet(models.QuerySet):
+    def in_category(self, category):
+        """Tests of an exam: the ones made for it plus the ones also shown in it (a Maths test shared by CHSL and CGL)."""
+        return self.filter(Q(category=category) | Q(also_in=category)).distinct()
+
     def with_totals(self):
         """Annotates total marks and question count with subqueries, so list pages do not query once per test
         and joins elsewhere in the query cannot inflate the numbers."""
@@ -82,6 +116,7 @@ class Exam(models.Model):
 
     class TestType(models.TextChoices):
         FULL = "full_test", "Full test"
+        MINI_MOCK = "mini_mock", "Mini mock"
         SECTIONAL = "sectional", "Subject test"
         PREVIOUS_YEAR = "previous_year", "Previous year paper"
 
@@ -100,7 +135,9 @@ class Exam(models.Model):
     # Only for sectional tests (for example "Maths only") and previous year papers respectively.
     subject = models.ForeignKey("questionbank.Subject", null=True, blank=True, on_delete=models.SET_NULL, related_name="exams")
     year = models.PositiveSmallIntegerField(null=True, blank=True)
-    thumbnail = models.ImageField(upload_to="exams/", null=True, blank=True)
+    # One of the exam's own tabs (see exams/tabs.py) to show this test in, instead of the tab of its type. Empty: by type.
+    tab_key = models.CharField(max_length=20, blank=True, default="")
+    thumbnail = models.ImageField(upload_to=exam_thumbnail_path, null=True, blank=True)
 
     class NegativeMode(models.TextChoices):
         QUESTION = "question", "Each question's own value"
@@ -123,6 +160,17 @@ class Exam(models.Model):
     shuffle_questions = models.BooleanField(default=False)
     shuffle_options = models.BooleanField(default=False)
     max_attempts = models.PositiveIntegerField(default=1)  # 0 = unlimited retakes
+    # A live test: everyone starts together at start_at and everyone ends together, start_at + duration. Joining stays open for
+    # late_join_minutes after the start, and a late joiner gets the time that is left, not the full duration.
+    is_live = models.BooleanField(default=False, db_index=True)
+    late_join_minutes = models.PositiveSmallIntegerField(default=10, validators=[MaxValueValidator(180)])
+    # Other exams that also show this test, besides its own exam (category). One test, one set of results.
+    also_in = models.ManyToManyField("ExamCategory", blank=True, related_name="shared_exams")
+    # A student may pause a running attempt: the clock stops, the questions are hidden, and the test resumes with the same
+    # time left. A pause ends by itself after pause_minutes so nobody can hold a test open for ever.
+    allow_pause = models.BooleanField(default=True)
+    max_pauses = models.PositiveSmallIntegerField(default=0, validators=[MaxValueValidator(20)])  # 0 = unlimited pauses
+    pause_minutes = models.PositiveSmallIntegerField(default=0, validators=[MaxValueValidator(120)])  # 0 = no limit: resume any time
 
     start_at = models.DateTimeField(null=True, blank=True)
     end_at = models.DateTimeField(null=True, blank=True)

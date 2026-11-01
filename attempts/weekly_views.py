@@ -16,7 +16,10 @@ class WeeklySummary(APIView):
 
 
 class Revise(APIView):
-    """GET ?source=saved|mistakes&limit=: revision cards, shuffled. `total` is how many exist before the limit."""
+    """
+    GET ?source=saved|mistakes&limit=&exam=: revision cards, shuffled. `total` is how many exist before the limit. `exam` (an exam's
+    public id) keeps only that exam's cards; `exams` lists the exams the student has cards for, with counts.
+    """
 
     permission_classes = [IsStudent]
 
@@ -33,5 +36,5 @@ class Revise(APIView):
         except ValueError:
             raise s.ValidationError({"limit": "Give a whole number."})
         limit = max(1, min(limit, revise.MAX_LIMIT))
-        total, cards = revise.cards(request.user, source, limit)
-        return Response({"source": source, "total": total, "cards": cards})
+        total, cards, exams = revise.cards(request.user, source, limit, request.query_params.get("exam") or None)
+        return Response({"source": source, "total": total, "cards": cards, "exams": exams})

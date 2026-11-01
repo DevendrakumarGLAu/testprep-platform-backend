@@ -49,6 +49,11 @@ def student_state(exam, user, now=None, active=None, used=None):
 
     if active:
         return "in_progress", True, "You have an attempt in progress."
+    if exam.is_live and exam.start_at:
+        if now < exam.start_at:
+            return "upcoming", False, "This live test has not started yet."
+        if now > exam.start_at + timedelta(minutes=exam.late_join_minutes):
+            return ("completed" if used else "missed"), False, "Joining for this live test has closed."
     if exam.start_at and now < exam.start_at:
         return "upcoming", False, "This test has not started yet."
     if exam.end_at and now > exam.end_at:
@@ -125,6 +130,8 @@ def start_attempt(exam: Exam, user) -> tuple[Attempt, bool]:
                 raise CannotStart("This test has no questions.")
 
             deadline = now + timedelta(minutes=exam.duration_minutes)
+            if exam.is_live and exam.start_at:
+                deadline = exam.start_at + timedelta(minutes=exam.duration_minutes)  # everyone finishes together
             if exam.end_at and exam.end_at < deadline:
                 deadline = exam.end_at  # the window closing ends the attempt, even mid-test
 
@@ -135,6 +142,7 @@ def start_attempt(exam: Exam, user) -> tuple[Attempt, bool]:
                 total_marks=exam.total_marks, passing_marks=exam.passing_marks,
                 negative_marking_enabled=exam.negative_marking_enabled,
                 unanswered_penalty=exam.unanswered_penalty, sectional_timing=exam.sectional_timing,
+                allow_pause=exam.allow_pause, max_pauses=exam.max_pauses, pause_minutes=exam.pause_minutes,
             )
 
             sections: dict[int, list] = {}
@@ -213,7 +221,7 @@ def score_attempt(attempt: Attempt, submitted_at) -> None:
     attempt.correct_count, attempt.incorrect_count, attempt.unanswered_count = correct, incorrect, unanswered
     attempt.accuracy = _q(Decimal(correct) * 100 / answered) if answered else Decimal("0.00")
     attempt.passed = attempt.score >= attempt.passing_marks
-    elapsed = (submitted_at - attempt.started_at).total_seconds()
+    elapsed = (submitted_at - attempt.started_at).total_seconds() - attempt.paused_seconds
     attempt.time_taken_seconds = int(max(0, min(elapsed, attempt.duration_minutes * 60)))
 
 
@@ -224,6 +232,8 @@ def submit_attempt(attempt_id: int, auto: bool = False) -> Attempt:
         if attempt.status == Attempt.Status.SUBMITTED:
             return attempt
         now = timezone.now()
+        if attempt.paused_at:
+            _resume_locked(attempt, now)  # the time spent paused is not part of the test
         attempt.status = Attempt.Status.SUBMITTED
         attempt.submitted_at = min(now, attempt.deadline) if auto else now
         attempt.auto_submitted = auto
@@ -233,17 +243,110 @@ def submit_attempt(attempt_id: int, auto: bool = False) -> Attempt:
 
 
 def expire_overdue(qs=None) -> int:
-    """Auto-submits every in-progress attempt whose deadline has passed."""
+    """Auto-submits every running attempt whose deadline has passed. A paused attempt keeps its clock stopped."""
     qs = qs if qs is not None else Attempt.objects.all()
-    ids = list(qs.filter(status=Attempt.Status.IN_PROGRESS, deadline__lt=timezone.now()).values_list("id", flat=True))
+    for a in qs.filter(status=Attempt.Status.IN_PROGRESS, paused_at__isnull=False).select_related("exam"):
+        settle_pause(a)  # a pause that has used up its time resumes by itself
+    ids = list(qs.filter(status=Attempt.Status.IN_PROGRESS, paused_at__isnull=True, deadline__lt=timezone.now()).values_list("id", flat=True))
     for i in ids:
         submit_attempt(i, auto=True)
     return len(ids)
 
 
 def remaining_seconds(attempt: Attempt, now=None) -> int:
-    now = now or timezone.now()
+    """Seconds left. While paused the clock is stopped, so this is what was left at the moment of the pause."""
+    now = attempt.paused_at or now or timezone.now()
     return max(0, int((attempt.deadline - now).total_seconds()))
+
+
+# --- pausing ---------------------------------------------------------------------------------
+
+class CannotPause(Exception):
+    def __init__(self, reason):
+        self.reason = reason
+
+
+def pause_ends_at(attempt: Attempt):
+    """When a pause that is running now will end by itself. None: it does not (pause_minutes 0 means a student may stay paused and resume any time)."""
+    if not attempt.paused_at or not attempt.pause_minutes:
+        return None
+    return attempt.paused_at + timedelta(minutes=attempt.pause_minutes)
+
+
+def pauses_left(attempt: Attempt):
+    """None means unlimited."""
+    return None if not attempt.max_pauses else max(0, attempt.max_pauses - attempt.pause_count)
+
+
+def _resume_locked(attempt: Attempt, now=None) -> None:
+    """Caller holds the row lock. Moves the deadline, and the running section clock, forward by the time paused."""
+    if attempt.paused_at is None:
+        return
+    now = now or timezone.now()
+    limit = pause_ends_at(attempt)
+    end = min(now, limit) if limit else now  # a pause counts for at most pause_minutes, when the test sets one
+    delta = max(timedelta(0), end - attempt.paused_at)
+    attempt.deadline = attempt.deadline + delta
+    cap = attempt.exam.end_at
+    if cap and attempt.deadline > cap:
+        attempt.deadline = cap  # the window closing still ends the attempt
+    attempt.paused_seconds += int(delta.total_seconds())
+    attempt.paused_at = None
+    attempt.save(update_fields=["deadline", "paused_seconds", "paused_at"])
+    running = list(attempt.section_states.filter(ended_at__isnull=True, started_at__isnull=False))
+    for st in running:
+        st.started_at = st.started_at + delta
+    if running:
+        AttemptSection.objects.bulk_update(running, ["started_at"])
+
+
+def settle_pause(attempt: Attempt) -> Attempt:
+    """Resumes a paused attempt whose pause has run out. Returns the attempt, refreshed if anything changed."""
+    limit = pause_ends_at(attempt)
+    if attempt.paused_at is None or limit is None or timezone.now() < limit:
+        return attempt
+    with transaction.atomic():
+        locked = Attempt.objects.select_for_update().select_related("exam").get(pk=attempt.pk)
+        if locked.status == Attempt.Status.IN_PROGRESS:
+            _resume_locked(locked)
+        return locked
+
+
+def pause_attempt(attempt_id: int) -> Attempt:
+    """Stops the clock. Idempotent while already paused. Raises CannotPause when the rules or the clock say no."""
+    out_of_time = False
+    with transaction.atomic():
+        attempt = Attempt.objects.select_for_update().select_related("exam").get(pk=attempt_id)
+        if attempt.status != Attempt.Status.IN_PROGRESS:
+            raise CannotPause("This attempt has already been submitted.")
+        if attempt.paused_at:
+            return attempt
+        now = timezone.now()
+        out_of_time = now > attempt.deadline
+        if attempt.sectional_timing and not out_of_time:
+            states = advance_sections(attempt, now)
+            out_of_time = bool(states) and all(s.ended_at for s in states)
+        if not out_of_time:
+            if not attempt.allow_pause:
+                raise CannotPause("Pausing is not allowed in this test.")
+            if pauses_left(attempt) == 0:
+                raise CannotPause(f"You have used all {attempt.max_pauses} pauses for this test.")
+            attempt.paused_at = now
+            attempt.pause_count += 1
+            attempt.save(update_fields=["paused_at", "pause_count"])
+            return attempt
+    # Out of time: score it now. Done outside the block above so raising below cannot undo the submission.
+    submit_attempt(attempt_id, auto=True)
+    raise CannotPause("Time is up. Your attempt was submitted.")
+
+
+def resume_attempt(attempt_id: int) -> Attempt:
+    """Restarts the clock with the same time left. Safe to call when the attempt is not paused."""
+    with transaction.atomic():
+        attempt = Attempt.objects.select_for_update().select_related("exam").get(pk=attempt_id)
+        if attempt.status == Attempt.Status.IN_PROGRESS:
+            _resume_locked(attempt)
+        return attempt
 
 
 def summary(attempt: Attempt) -> dict:

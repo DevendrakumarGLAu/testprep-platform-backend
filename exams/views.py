@@ -14,9 +14,9 @@ from core.numbers import money
 from accounts.permissions import IsAdminOrSuperAdmin
 from accounts.serializers import UserSerializer
 
-from .models import Batch, Exam, ExamCategory, ExamQuestion, ExamSection
+from .models import Batch, Exam, ExamCategory, ExamGroup, ExamQuestion, ExamSection
 from .serializers import (
-    AssignmentSerializer, BatchSerializer, ExamCategorySerializer, ExamSectionReadSerializer,
+    AssignmentSerializer, BatchSerializer, ExamCategorySerializer, ExamGroupSerializer, ExamSectionReadSerializer,
     ExamSerializer, StructureSerializer,
 )
 
@@ -81,7 +81,11 @@ class ExamCategoryViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
     def get_queryset(self):
-        return ExamCategory.objects.annotate(exam_count=Count("exams", distinct=True)).prefetch_related("subjects").order_by("name")
+        return (
+            ExamCategory.objects.select_related("group")
+            .annotate(exam_count=Count("exams", distinct=True) + Count("shared_exams", distinct=True))
+            .prefetch_related("subjects").order_by("group__order", "group__name", "name")
+        )
 
     def perform_create(self, serializer):
         log_activity(self.request.user, "exam_category.create", serializer.save())
@@ -91,13 +95,42 @@ class ExamCategoryViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         cat = self.get_object()
-        if cat.exams.exists():
+        if cat.exams.exists() or cat.shared_exams.exists():
             return Response(
                 {"detail": "Tests belong to this exam, so it cannot be deleted. Mark it inactive instead."},
                 status=status.HTTP_409_CONFLICT,
             )
         log_activity(request.user, "exam_category.delete", None, cat.name)
         cat.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ExamGroupViewSet(viewsets.ModelViewSet):
+    """Families of exams, for example SSC (MTS, CHSL, CGL)."""
+
+    serializer_class = ExamGroupSerializer
+    permission_classes = [IsAdminOrSuperAdmin]
+    filterset_fields = ["is_active"]
+    search_fields = ["name"]
+
+    def get_queryset(self):
+        return ExamGroup.objects.annotate(exam_count=Count("categories", distinct=True)).order_by("order", "name")
+
+    def perform_create(self, serializer):
+        log_activity(self.request.user, "exam_group.create", serializer.save())
+
+    def perform_update(self, serializer):
+        log_activity(self.request.user, "exam_group.update", serializer.save())
+
+    def destroy(self, request, *args, **kwargs):
+        group = self.get_object()
+        if group.categories.exists():
+            return Response(
+                {"detail": "Exams belong to this family. Move them to another family first, or mark it inactive."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        log_activity(request.user, "exam_group.delete", None, group.name)
+        group.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -120,6 +153,11 @@ def publish_problems(exam: Exam) -> list[str]:
             problems.append(f"Question #{q.id} has invalid options.")
     if exam.total_marks > 0 and exam.passing_marks > exam.total_marks:
         problems.append(f"Passing marks ({exam.passing_marks}) exceed total marks ({exam.total_marks}).")
+    if exam.is_live:
+        if not exam.start_at:
+            problems.append("A live test needs a start time.")
+        elif exam.start_at <= timezone.now():
+            problems.append("The start time of a live test must be in the future. Set a new start time.")
     if exam.start_at and exam.end_at:
         if exam.end_at <= timezone.now():
             problems.append("The end time is already in the past.")
@@ -144,13 +182,13 @@ def publish_problems(exam: Exam) -> list[str]:
 class ExamViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSerializer
     permission_classes = [IsAdminOrSuperAdmin]
-    filterset_fields = ["status", "category", "access_type", "test_type", "subject"]
+    filterset_fields = ["status", "category", "access_type", "test_type", "subject", "is_live"]
     search_fields = ["title", "description"]
     ordering_fields = ["created_at", "updated_at", "start_at", "title"]
     parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     def get_queryset(self):
-        qs = Exam.objects.filter(is_practice=False).select_related("category", "subject").prefetch_related("assigned_students", "assigned_batches", "premium_students", "premium_batches")
+        qs = Exam.objects.filter(is_practice=False).select_related("category", "subject").prefetch_related("assigned_students", "assigned_batches", "premium_students", "premium_batches", "also_in")
         return qs.with_totals() if self.action == "list" else qs
 
     def perform_create(self, serializer):
@@ -263,6 +301,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                     )
                     for i in section.items.select_related("question")
                 )
+            copy.also_in.set(src.also_in.all())
             copy.assigned_students.set(src.assigned_students.all())
             copy.assigned_batches.set(src.assigned_batches.all())
             copy.premium_students.set(src.premium_students.all())
@@ -362,4 +401,5 @@ class ExamViewSet(viewsets.ModelViewSet):
             "question_count": exam.question_count, "negative_marking_enabled": exam.negative_marking_enabled,
             "max_attempts": exam.max_attempts, "start_at": exam.start_at, "end_at": exam.end_at,
             "sectional_timing": exam.sectional_timing, "sections": sections,
+            "allow_pause": exam.allow_pause, "max_pauses": exam.max_pauses, "pause_minutes": exam.pause_minutes,
         })

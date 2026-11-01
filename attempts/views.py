@@ -1,3 +1,4 @@
+import re
 from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
@@ -12,8 +13,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsStudent
+from core.media import media_url
 from core.numbers import money
 from exams.models import Exam, ExamCategory, Preparation
+from exams.tabs import custom_keys, resolve_tabs
 from questionbank.models import Question
 
 from . import services as svc
@@ -23,9 +26,27 @@ from .results import build_result
 
 
 def _img(request, path):
-    if not path:
-        return None
-    return request.build_absolute_uri("/" + settings.MEDIA_URL.strip("/") + "/" + path)
+    return media_url(request, path)
+
+
+def _last_submitted(request, user) -> dict:
+    """The student's most recent submitted attempt for every test, worked out once per request."""
+    if not hasattr(request, "_last_submitted"):
+        latest = {}
+        for exam_id, pid in Attempt.objects.filter(student=user, status=Attempt.Status.SUBMITTED).order_by("-id").values_list("exam_id", "public_id"):
+            latest.setdefault(exam_id, pid)  # newest first, so the first one seen is the latest
+        request._last_submitted = latest
+    return request._last_submitted
+
+
+def natural_key(title):
+    """Sort key that puts "Mock 2" before "Mock 10" (numbers compared as numbers, case ignored)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", (title or "").lower())]
+
+
+def by_title(cards):
+    """Test cards in natural title order, so a series reads 1, 2, 3 ... 10 whatever order they were created or stored in."""
+    return sorted(cards, key=lambda c: (natural_key(c["title"]), c["id"]))
 
 
 def exam_card(request, exam, user, now, active_by_exam, used_by_exam):
@@ -45,6 +66,7 @@ def exam_card(request, exam, user, now, active_by_exam, used_by_exam):
         "description": exam.description,
         "category": exam.category.public_id if exam.category else None,
         "category_name": exam.category.name if exam.category else None,
+        "also_in": [c.public_id for c in exam.also_in.all()],  # other exams that show this test too
         "test_type": exam.test_type,
         "test_type_label": exam.get_test_type_display(),
         "subject": exam.subject_id,
@@ -60,10 +82,15 @@ def exam_card(request, exam, user, now, active_by_exam, used_by_exam):
         "attempts_used": used,
         "negative_marking_enabled": exam.negative_marking_enabled,
         "sectional_timing": exam.sectional_timing,
+        "is_live": exam.is_live,
+        "join_closes_at": exam.start_at + timedelta(minutes=exam.late_join_minutes) if exam.is_live and exam.start_at else None,
         "status": status,
         "can_start": can_start,
         "reason": reason,
         "active_attempt_id": active.public_id if active else None,
+        # Where a student who has already taken this test can look at the result.
+        "last_attempt_id": (last := _last_submitted(request, user).get(exam.id)),
+        "result_available": bool(last) and svc.result_visible(exam, now),
         "premium": exam.is_premium,
         "price": str(exam.price) if exam.price is not None else None,
         "locked": locked,
@@ -85,17 +112,22 @@ class StudentExamList(APIView):
 
     def get(self, request):
         user, now = request.user, timezone.now()
-        qs = svc.visible_exams(user).select_related("category", "subject").with_totals()
+        qs = svc.visible_exams(user).select_related("category", "subject").prefetch_related("also_in").with_totals()
         if c := request.query_params.get("category"):
-            qs = qs.filter(category__public_id=c)
+            qs = qs.filter(Q(category__public_id=c) | Q(also_in__public_id=c)).distinct()
         if s := request.query_params.get("subject"):
             qs = qs.filter(sections__items__question__subject_id=s).distinct()
         if t := request.query_params.get("test_type"):
             qs = qs.filter(test_type=t)
         if q := request.query_params.get("search"):
             qs = qs.filter(Q(title__icontains=q) | Q(description__icontains=q))
+        if request.query_params.get("live"):
+            qs = qs.filter(is_live=True, end_at__gte=now)  # live tests that have not finished yet
         active, used = _context(user)
-        cards = [exam_card(request, e, user, now, active, used) for e in qs.order_by("start_at", "-created_at")]
+        cards = [exam_card(request, e, user, now, active, used) for e in qs.order_by()]
+        # Tests with a start time come first, soonest first; the rest follow in natural title order (the database would put the
+        # ones without a start time first or last depending on which database it is, which is why production differed from local).
+        cards.sort(key=lambda c: (c["start_at"] is None, c["start_at"] or "", natural_key(c["title"]), c["id"]))
         wanted = request.query_params.get("status")
         if wanted:
             cards = [c for c in cards if c["status"] == wanted]
@@ -114,8 +146,9 @@ class StudentFilters(APIView):
         visible = svc.visible_exams(request.user)
         return Response({
             "categories": [
-                {"id": c["public_id"], "name": c["name"]}
-                for c in ExamCategory.objects.filter(exams__in=visible).distinct().order_by("name").values("public_id", "name")
+                {"id": c.public_id, "name": c.name, "group": {"id": c.group.public_id, "name": c.group.name} if c.group and c.group.is_active else None}
+                for c in ExamCategory.objects.filter(Q(exams__in=visible) | Q(shared_exams__in=visible))
+                .select_related("group").distinct().order_by("group__order", "group__name", "name")
             ],
             "subjects": list(Subject.objects.filter(questions__exam_items__section__exam__in=visible).distinct().order_by("name").values("id", "name")),
         })
@@ -127,21 +160,32 @@ def _prep_payload(user) -> dict:
     rows = visible.exclude(category=None).values("category", "test_type").annotate(n=Count("id", distinct=True))
     for r in rows:
         counts[r["category"]][r["test_type"]] += r["n"]
+    # A test shared with other exams counts in each of them.
+    for r in visible.filter(also_in__isnull=False).values("also_in", "test_type").annotate(n=Count("id", distinct=True)):
+        counts[r["also_in"]][r["test_type"]] += r["n"]
     mine = set(Preparation.objects.filter(student=user).values_list("category_id", flat=True))
     public = dict(ExamCategory.objects.values_list("id", "public_id"))
     exams = []
-    for c in ExamCategory.objects.filter(is_active=True).prefetch_related("subjects").order_by("name"):
+    families = {}
+    for c in ExamCategory.objects.filter(is_active=True).select_related("group").prefetch_related("subjects").order_by("group__order", "group__name", "name"):
         if c.id not in counts and c.id not in mine:
             continue  # nothing to prepare with yet
         k = counts[c.id]
+        group = c.group if c.group and c.group.is_active else None
+        if group:
+            families[group.id] = {"id": group.public_id, "name": group.name, "description": group.description, "order": group.order}
         exams.append({
             "id": c.public_id, "name": c.name, "description": c.description,
+            "group": {"id": group.public_id, "name": group.name} if group else None,
             "subjects": [s.name for s in c.subjects.all()],
-            "counts": {"full_test": k["full_test"], "sectional": k["sectional"], "previous_year": k["previous_year"],
+            "counts": {"full_test": k["full_test"], "mini_mock": k["mini_mock"], "sectional": k["sectional"], "previous_year": k["previous_year"],
                        "total": sum(k.values())},
             "preparing": c.id in mine,
         })
-    return {"exams": exams, "preparing": sorted(public[i] for i in mine)}
+    return {
+        "exams": exams, "preparing": sorted(public[i] for i in mine),
+        "families": sorted(families.values(), key=lambda f: (f["order"], f["name"])),
+    }
 
 
 class PrepList(APIView):
@@ -174,17 +218,30 @@ class PrepHub(APIView):
 
     def get(self, request, pid):
         user, now = request.user, timezone.now()
-        cat = get_object_or_404(ExamCategory.objects.prefetch_related("subjects"), public_id=pid, is_active=True)
-        qs = svc.visible_exams(user).filter(category=cat).select_related("category", "subject").with_totals()
+        cat = get_object_or_404(ExamCategory.objects.select_related("group").prefetch_related("subjects"), public_id=pid, is_active=True)
+        qs = svc.visible_exams(user).in_category(cat).select_related("category", "subject").prefetch_related("also_in").with_totals()
         active, used = _context(user)
-        cards = [exam_card(request, e, user, now, active, used) for e in qs.order_by("title")]
+        exams = list(qs.order_by("title"))
+        cards = [exam_card(request, e, user, now, active, used) for e in exams]
 
-        full = [c for c in cards if c["test_type"] == Exam.TestType.FULL]
+        # A test the admin put in one of this exam's own tabs shows there instead of in the tab of its type. A test that is only
+        # shared into this exam (its own exam is another one) always goes by type, because the tab belongs to its own exam.
+        own_tabs = custom_keys(cat.tabs)
+        custom: dict[str, list] = {k: [] for k in own_tabs}
+        by_type = []
+        for e, c in zip(exams, cards):
+            if e.category_id == cat.id and e.tab_key in own_tabs:
+                custom[e.tab_key].append(c)
+            else:
+                by_type.append(c)
+
+        full = by_title(c for c in by_type if c["test_type"] == Exam.TestType.FULL)
+        mini = by_title(c for c in by_type if c["test_type"] == Exam.TestType.MINI_MOCK)
         previous = sorted(
-            (c for c in cards if c["test_type"] == Exam.TestType.PREVIOUS_YEAR), key=lambda c: (-(c["year"] or 0), c["title"])
+            (c for c in by_type if c["test_type"] == Exam.TestType.PREVIOUS_YEAR), key=lambda c: (-(c["year"] or 0), natural_key(c["title"]))
         )
         by_subject: dict[int | None, list] = defaultdict(list)
-        for c in cards:
+        for c in by_type:
             if c["test_type"] == Exam.TestType.SECTIONAL:
                 by_subject[c["subject"]].append(c)
         names = {s.id: s.name for s in cat.subjects.all()}
@@ -192,19 +249,58 @@ class PrepHub(APIView):
             if c["subject"] and c["subject"] not in names:
                 names[c["subject"]] = c["subject_name"]
         order = [s.id for s in cat.subjects.all()] + sorted((i for i in by_subject if i not in {s.id for s in cat.subjects.all()}), key=lambda i: names.get(i) or "")
-        subject_tests = [{"subject": i, "subject_name": names.get(i, "General"), "tests": by_subject.get(i, [])} for i in order]
+        subject_tests = [{"subject": i, "subject_name": names.get(i, "General"), "tests": by_title(by_subject.get(i, []))} for i in order]
         subject_tests.sort(key=lambda g: not g["tests"])  # subjects with tests first, upcoming ones (no tests yet) last
 
         tried = sum(1 for c in cards if c["attempts_used"] or c["status"] == "in_progress")
         return Response({
             "exam": {"id": cat.public_id, "name": cat.name, "description": cat.description,
+                     "group": {"id": cat.group.public_id, "name": cat.group.name} if cat.group else None,
                      "subjects": [{"id": s.id, "name": s.name} for s in cat.subjects.all()]},
             "preparing": Preparation.objects.filter(student=user, category=cat).exists(),
+            "tabs": resolve_tabs(cat.tabs),
+            "custom_tests": {k: by_title(v) for k, v in custom.items()},
             "full_tests": full,
+            "mini_mocks": mini,
             "subject_tests": subject_tests,
             "previous_year": previous,
             "progress": {"total": len(cards), "attempted": tried},
         })
+
+
+class StudentLiveExam(APIView):
+    """
+    The page behind a live test's share link: when it starts, how long it runs and where it stands, by the server's clock. Only for a
+    signed-in student who is allowed to take the test; anyone else gets nothing, as for any test they cannot see. Never the questions.
+    """
+
+    permission_classes = [IsStudent]
+
+    def get(self, request, pid):
+        exam = get_object_or_404(
+            svc.visible_exams(request.user).filter(is_live=True).select_related("category__group", "subject"), public_id=pid
+        )
+        now = timezone.now()
+        active, used = _context(request.user)
+        card = exam_card(request, exam, request.user, now, active, used)
+        closes = exam.start_at + timedelta(minutes=exam.late_join_minutes)
+        if now < exam.start_at:
+            state = "upcoming"
+        elif now <= closes:
+            state = "live"
+        elif exam.end_at and now <= exam.end_at:
+            state = "joining_closed"
+        else:
+            state = "ended"
+        group = exam.category.group if exam.category and exam.category.group and exam.category.group.is_active else None
+        response = Response({
+            **card,
+            "family": group.name if group else None,
+            "ends_at": exam.end_at, "late_join_minutes": exam.late_join_minutes,
+            "state": state, "server_now": now,
+        })
+        response["Cache-Control"] = "no-store"  # a countdown must never come from a cache
+        return response
 
 
 class StudentExamDetail(APIView):
@@ -215,9 +311,12 @@ class StudentExamDetail(APIView):
         active, used = _context(request.user)
         data = exam_card(request, exam, request.user, timezone.now(), active, used)
         data["instructions"] = exam.instructions
+        data["server_now"] = timezone.now()  # lets a live test count down to its start by the server clock
+        data["late_join_minutes"] = exam.late_join_minutes
         qs = Question.objects.filter(exam_items__section__exam=exam)
         data["languages"] = [c for c, on in (("en", qs.exclude(text="").exists()), ("hi", qs.exclude(text_hi="").exists())) if on]
         data["unanswered_penalty"] = str(exam.unanswered_penalty)
+        data["allow_pause"], data["max_pauses"], data["pause_minutes"] = exam.allow_pause, exam.max_pauses, exam.pause_minutes
         data["sections"] = [
             {"name": s.name, "question_count": s.items.count(), "duration_minutes": s.duration_minutes if exam.sectional_timing else None}
             for s in exam.sections.all()
@@ -242,9 +341,20 @@ def own_attempt(request, pid) -> Attempt:
     return get_object_or_404(Attempt.objects.select_related("exam"), public_id=pid, student=request.user)
 
 
+def pause_info(attempt: Attempt) -> dict:
+    return {
+        "allowed": attempt.allow_pause, "paused": attempt.paused_at is not None, "paused_at": attempt.paused_at,
+        "auto_resume_at": svc.pause_ends_at(attempt), "max_minutes": attempt.pause_minutes,
+        "pauses_used": attempt.pause_count, "pauses_left": svc.pauses_left(attempt),
+    }
+
+
 def clock(attempt):
     now = timezone.now()
-    return {"server_now": now, "deadline": attempt.deadline, "remaining_seconds": svc.remaining_seconds(attempt, now)}
+    return {
+        "server_now": now, "deadline": attempt.deadline, "remaining_seconds": svc.remaining_seconds(attempt, now),
+        "pause": pause_info(attempt),
+    }
 
 
 def _question_dict(request, attempt: Attempt, aq: AttemptQuestion) -> dict:
@@ -265,10 +375,12 @@ def attempt_payload(request, attempt: Attempt) -> dict:
     finished ones cannot be revisited.
     """
     if attempt.status == Attempt.Status.IN_PROGRESS:
-        states = svc.advance_sections(attempt)
-        if timezone.now() > attempt.deadline or (states and all(s.ended_at for s in states)):
-            svc.submit_attempt(attempt.id, auto=True)
-            attempt = Attempt.objects.select_related("exam").get(pk=attempt.pk)
+        attempt = svc.settle_pause(attempt)  # a pause that ran out of time has already ended
+        if attempt.paused_at is None:
+            states = svc.advance_sections(attempt)
+            if timezone.now() > attempt.deadline or (states and all(s.ended_at for s in states)):
+                svc.submit_attempt(attempt.id, auto=True)
+                attempt = Attempt.objects.select_related("exam").get(pk=attempt.pk)
     base = {
         "id": attempt.public_id, "status": attempt.status, "attempt_number": attempt.attempt_number,
         "sectional": attempt.sectional_timing,
@@ -280,6 +392,9 @@ def attempt_payload(request, attempt: Attempt) -> dict:
     }
     if attempt.status == Attempt.Status.SUBMITTED:
         return {**base, **submitted_payload(attempt)}
+    if attempt.paused_at is not None:
+        # Nothing of the test is shown while it is paused.
+        return {**base, "paused": True, "languages": [], "sections": [], "active_section": None}
 
     members: dict[int, list[AttemptQuestion]] = {}
     names: dict[int, str] = {}
@@ -330,7 +445,9 @@ class SubmitSection(APIView):
     permission_classes = [IsStudent]
 
     def post(self, request, pid):
-        attempt = own_attempt(request, pid)
+        attempt = svc.settle_pause(own_attempt(request, pid))
+        if attempt.paused_at is not None:
+            return Response({"detail": "The test is paused. Resume it to continue.", "paused": True}, status=409)
         if not attempt.sectional_timing:
             return Response({"detail": "This test does not have timed sections."}, status=400)
         order = request.data.get("order")
@@ -367,6 +484,9 @@ class SaveAnswers(APIView):
         now = timezone.now()
         if attempt.status != Attempt.Status.IN_PROGRESS:
             return Response({"detail": "This attempt has already been submitted.", "status": attempt.status}, status=409)
+        attempt = svc.settle_pause(attempt)
+        if attempt.paused_at is not None:
+            return Response({"detail": "The test is paused. Resume it to continue.", "paused": True, "status": attempt.status}, status=409)
         if now > attempt.deadline + timedelta(seconds=svc.GRACE_SECONDS):
             done = svc.submit_attempt(attempt.id, auto=True)
             return Response({"detail": "Time is up. Your attempt was submitted.", "status": done.status}, status=409)
@@ -384,7 +504,7 @@ class SaveAnswers(APIView):
             open_orders = svc.open_section_orders(states, now)
         ignored = 0
         # Time cannot add up to more than the attempt has actually been running (plus a little network slack).
-        budget = max(0, (now - attempt.started_at).total_seconds() + svc.GRACE_SECONDS) - sum(r.time_spent_seconds for r in rows.values())
+        budget = max(0, (now - attempt.started_at).total_seconds() - attempt.paused_seconds + svc.GRACE_SECONDS) - sum(r.time_spent_seconds for r in rows.values())
         changed = []
         for item in ser.validated_data:
             aq = rows.get(item["question"])
@@ -418,7 +538,9 @@ class SubmitAttempt(APIView):
     permission_classes = [IsStudent]
 
     def post(self, request, pid):
-        attempt = own_attempt(request, pid)
+        attempt = svc.settle_pause(own_attempt(request, pid))
+        if attempt.status == Attempt.Status.IN_PROGRESS and attempt.paused_at is not None:
+            attempt = svc.resume_attempt(attempt.id)  # submitting ends the pause; the paused time is not counted
         auto = timezone.now() > attempt.deadline
         if attempt.sectional_timing and not auto and attempt.status == Attempt.Status.IN_PROGRESS:
             states = svc.advance_sections(attempt)
@@ -428,6 +550,35 @@ class SubmitAttempt(APIView):
         done = svc.submit_attempt(attempt.id, auto=auto)
         done = Attempt.objects.select_related("exam").get(pk=done.pk)
         return Response({"id": done.public_id, "status": done.status, **submitted_payload(done)})
+
+
+class PauseAttempt(APIView):
+    """Stops the clock and hides the test until the student resumes. Idempotent."""
+
+    permission_classes = [IsStudent]
+
+    def post(self, request, pid):
+        attempt = own_attempt(request, pid)
+        try:
+            updated = svc.pause_attempt(attempt.id)
+        except svc.CannotPause as e:
+            return Response({"detail": e.reason}, status=409)
+        updated = Attempt.objects.select_related("exam").get(pk=updated.pk)
+        return Response(attempt_payload(request, updated))
+
+
+class ResumeAttempt(APIView):
+    """Restarts the clock with the same time left and returns the test as the student left it."""
+
+    permission_classes = [IsStudent]
+
+    def post(self, request, pid):
+        attempt = own_attempt(request, pid)
+        if attempt.status != Attempt.Status.IN_PROGRESS:
+            return Response({"detail": "This attempt has already been submitted.", "status": attempt.status}, status=409)
+        updated = svc.resume_attempt(attempt.id)
+        updated = Attempt.objects.select_related("exam").get(pk=updated.pk)
+        return Response(attempt_payload(request, updated))
 
 
 class AttemptResult(APIView):
@@ -501,19 +652,19 @@ class StudentDashboard(APIView):
                 s["correct"] += 1 if r["is_correct"] else 0
 
         attempted_exam_ids = {a.exam_id for a in attempts}
-        mine = list(Preparation.objects.filter(student=user).select_related("category"))
-        totals = dict(
-            svc.visible_exams(user).order_by().filter(category__in=[p.category_id for p in mine])
-            .values_list("category").annotate(n=Count("id", distinct=True))
-        )
-        tried = dict(
-            Attempt.objects.filter(student=user, status=Attempt.Status.SUBMITTED, exam__category__in=[p.category_id for p in mine])
-            .values_list("exam__category").annotate(n=Count("exam", distinct=True))
-        )
+        mine = list(Preparation.objects.filter(student=user).select_related("category__group"))
+        totals, tried = {}, {}
+        for p in mine:
+            in_exam = svc.visible_exams(user).order_by().in_category(p.category)
+            totals[p.category_id] = in_exam.count()
+            tried[p.category_id] = (
+                Attempt.objects.filter(student=user, status=Attempt.Status.SUBMITTED, exam__in=in_exam).values("exam").distinct().count()
+            )
         return Response({
             "preparing": [
                 {"id": p.category.public_id, "name": p.category.name, "total_tests": totals.get(p.category_id, 0),
-                 "attempted_tests": tried.get(p.category_id, 0)}
+                 "attempted_tests": tried.get(p.category_id, 0),
+                 "group": {"id": p.category.group.public_id, "name": p.category.group.name} if p.category.group and p.category.group.is_active else None}
                 for p in mine if p.category.is_active
             ],
             "counts": {
