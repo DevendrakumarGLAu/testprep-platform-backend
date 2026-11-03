@@ -1,7 +1,10 @@
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 
 from core.ids import new_public_id
+from core.media import unique_upload_path
 
 
 class StudyNote(models.Model):
@@ -62,3 +65,56 @@ class SeriesItem(models.Model):
     class Meta:
         ordering = ["order", "id"]
         constraints = [models.UniqueConstraint(fields=["series", "exam"], name="one_exam_once_per_series")]
+
+
+def popup_image_path(instance, filename):
+    return unique_upload_path("popups", filename)
+
+
+class Popup(models.Model):
+    """
+    A message that opens in a pop-up the next time a student visits (a new launch, a new feature, an important date). Each
+    student sees it once, until they close it or press its button. It stops showing when `ends_at` passes or it is switched off.
+    """
+
+    class Audience(models.TextChoices):
+        ALL = "all", "All students"
+        EXAM = "exam", "Students preparing for an exam"
+        BATCH = "batch", "A batch"
+
+    title = models.CharField(max_length=120)
+    body = models.TextField(blank=True, max_length=800)
+    # An optional button: a page of this app ("/student/plan") or a web address ("https://...").
+    link = models.CharField(max_length=300, blank=True)
+    button_label = models.CharField(max_length=30, blank=True, default="Open")
+    # An optional banner shown above the title; kept in the same storage as question pictures (Supabase in production).
+    image = models.ImageField(upload_to=popup_image_path, null=True, blank=True)
+    audience = models.CharField(max_length=5, choices=Audience.choices, default=Audience.ALL)
+    category = models.ForeignKey("exams.ExamCategory", null=True, blank=True, on_delete=models.CASCADE, related_name="+")
+    batch = models.ForeignKey("exams.Batch", null=True, blank=True, on_delete=models.CASCADE, related_name="+")
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
+class PopupSeen(models.Model):
+    """That a student has closed (or used) a pop-up, so it is not shown to them again."""
+
+    popup = models.ForeignKey(Popup, on_delete=models.CASCADE, related_name="seen")
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    seen_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("popup", "student")]
+
+
+@receiver(post_delete, sender=Popup)
+def delete_popup_image(sender, instance, **kwargs):
+    if instance.image:
+        instance.image.storage.delete(instance.image.name)

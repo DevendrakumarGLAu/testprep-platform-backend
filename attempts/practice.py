@@ -95,11 +95,15 @@ def _already_wrong(student):
 def weak_topic_questions(student, topics, count):
     """
     Active questions from the chosen topics, those the student got wrong before first, then ones they have not seen,
-    then the rest. `topics` is a list of {"topic_id", "subject_id"} pairs; a null topic means the whole subject.
+    then the rest. `topics` is a list of {"topic_id", "subject_id"} pairs; a null topic means the questions of that subject that have
+    no topic, and "whole_subject": true means every topic of the subject.
     """
     match = Q()
     for t in topics:
-        match |= Q(topic_id=t["topic_id"]) if t.get("topic_id") else Q(subject_id=t["subject_id"], topic__isnull=True)
+        if t.get("whole_subject") and t.get("subject_id"):
+            match |= Q(subject_id=t["subject_id"])
+        else:
+            match |= Q(topic_id=t["topic_id"]) if t.get("topic_id") else Q(subject_id=t["subject_id"], topic__isnull=True)
     pool = list(Question.objects.filter(match, is_active=True))
     wrong = _already_wrong(student)
     seen = set(AttemptQuestion.objects.filter(attempt__student=student).exclude(question=None).values_list("question_id", flat=True))

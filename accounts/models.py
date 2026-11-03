@@ -65,6 +65,9 @@ class PlatformSettings(models.Model):
     platform_name = models.CharField(max_length=60, default="TestPrep")
     allow_registration = models.BooleanField(default=True)
     support_email = models.EmailField(blank=True)
+    # How people reach you for help (for example a forgotten password when emails are off): shown on the login page.
+    support_phone = models.CharField(max_length=40, blank=True)
+    support_hours = models.CharField(max_length=80, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

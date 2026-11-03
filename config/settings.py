@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     "reports",
     "content",
     "notifications",
+    "coach",
 ]
 
 MIDDLEWARE = [
@@ -174,7 +175,7 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.ScopedRateThrottle",
     ],
     # The user rate is generous because the exam screen autosaves every answer.
-    "DEFAULT_THROTTLE_RATES": {"anon": "120/min", "user": "1500/min", "auth": "20/min", "captcha": "40/min"},
+    "DEFAULT_THROTTLE_RATES": {"anon": "120/min", "user": "1500/min", "auth": "20/min", "captcha": "40/min", "feedback": "60/min"},
 }
 
 SIMPLE_JWT = {

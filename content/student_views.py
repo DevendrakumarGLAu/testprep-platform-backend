@@ -4,11 +4,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsStudent
+from core.media import media_url
 from attempts import services as svc
 from attempts.models import Attempt
 from attempts.views import _context, exam_card
 
-from .models import StudyNote, TestSeries
+from . import popups
+from .models import Popup, StudyNote, TestSeries
 
 
 def note_summary(n: StudyNote) -> dict:
@@ -80,3 +82,28 @@ class SeriesDetail(APIView):
             "total": len(cards), "attempted": sum(1 for c in cards if c["attempts_used"] > 0),
             "tests": cards,
         })
+
+
+def popup_payload(p: Popup, request) -> dict:
+    return {
+        "id": p.id, "title": p.title, "body": p.body, "image_url": media_url(request, p.image.name) if p.image else None,
+        "link": p.link, "button_label": p.button_label or "Open",
+    }
+
+
+class PopupPending(APIView):
+    """The pop-up waiting for this student, if any. Closing it (or using its button) marks it seen."""
+
+    permission_classes = [IsStudent]
+
+    def get(self, request):
+        popup = popups.pending_for(request.user)
+        return Response({"popup": popup_payload(popup, request) if popup else None})
+
+
+class PopupSeenView(APIView):
+    permission_classes = [IsStudent]
+
+    def post(self, request, pk):
+        popups.mark_seen(get_object_or_404(Popup, pk=pk), request.user)
+        return Response(status=204)

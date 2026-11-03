@@ -59,7 +59,7 @@ class PracticeWeak(PracticeView):
         for t in topics:
             if not isinstance(t, dict) or not (t.get("topic_id") or t.get("subject_id")):
                 raise serializers.ValidationError({"topics": "Each topic needs a topic_id or a subject_id."})
-            clean.append({"topic_id": t.get("topic_id"), "subject_id": t.get("subject_id")})
+            clean.append({"topic_id": t.get("topic_id"), "subject_id": t.get("subject_id"), "whole_subject": bool(t.get("whole_subject"))})
         questions = practice.weak_topic_questions(request.user, clean, count)
         exam = practice.build_practice_exam(request.user, questions, f"Practice: weak topics ({timezone.localdate():%d %b})", "weak")
         return _start(request.user, exam)

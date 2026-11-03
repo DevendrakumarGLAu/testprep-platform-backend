@@ -79,6 +79,15 @@ class PracticeSetTests(PracticeBase):
         self.assertEqual(a.status_code, 200)
         self.assertEqual(len([q for s in a.data["sections"] for q in s["questions"]]), 8)
 
+    def test_a_whole_subject_set_uses_every_topic_of_the_subject(self):
+        self.topic_questions(self.rivers, 3, "riv")
+        self.topic_questions(self.algebra, 3, "alg")
+        r = self.client.post("/api/student/practice/weak/", {"count": 10, "topics": [{"subject_id": self.subject.id, "topic_id": None, "whole_subject": True}]}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        exam = Exam.objects.get(public_id=r.data["exam_id"])
+        topics = set(exam.sections.first().items.values_list("question__topic__name", flat=True))
+        self.assertTrue({"Rivers", "Algebra"} <= topics)  # topics of the subject, and its questions that have no topic
+
     def test_practice_sets_stay_out_of_every_list(self):
         self.take(self.exam_with(self.topic_questions(self.rivers, 5, "riv")), right=0)
         self.client.post("/api/student/practice/weak/", {"count": 5}, format="json")

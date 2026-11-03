@@ -34,6 +34,43 @@ def best_attempts(exam):
     return out
 
 
+def percentile(ranked, score) -> float:
+    """The share of students (yourself included) whose best score is the same as yours or lower, as in the real exams."""
+    total = len(ranked)
+    return round(sum(1 for _, other in ranked if other.score <= score) * 100 / total, 1) if total else 0.0
+
+
+class MyRanks(APIView):
+    """GET: the student's rank and percentile in each test they have finished (best attempt), newest first."""
+
+    permission_classes = [IsStudent]
+
+    def get(self, request):
+        mine = (
+            Attempt.objects.filter(student=request.user, status=Attempt.Status.SUBMITTED, score__isnull=False, exam__is_practice=False)
+            .select_related("exam").order_by("-submitted_at", "-id")
+        )
+        seen, rows = set(), []
+        for a in mine:
+            if a.exam_id in seen or not svc.result_visible(a.exam):
+                continue
+            seen.add(a.exam_id)
+            if len(rows) >= 30:
+                break
+            ranked = best_attempts(a.exam)
+            best = next(((r, x) for r, x in ranked if x.student_id == request.user.id), None)
+            if best is None:
+                continue
+            rank, x = best
+            rows.append({
+                "exam_id": a.exam.public_id, "exam_title": a.exam.title, "date": (x.submitted_at or a.submitted_at), "rank": rank,
+                "participants": len(ranked), "percentile": percentile(ranked, x.score), "score": str(x.score), "total_marks": str(x.total_marks),
+                "percent": round(float(x.score) / float(x.total_marks) * 100, 1) if x.total_marks else None, "attempt_id": x.public_id,
+            })
+        avg = round(sum(r["percentile"] for r in rows) / len(rows), 1) if rows else None
+        return Response({"results": rows, "average_percentile": avg})
+
+
 class Leaderboard(APIView):
     permission_classes = [IsStudent]
 
@@ -56,7 +93,8 @@ class Leaderboard(APIView):
         if mine:
             rank, a = mine
             lower = sum(1 for _, other in ranked if other.score < a.score)
-            me = {**row(rank, a), "better_than_percent": round(lower * 100 / total, 1) if total else 0}
+            me = {**row(rank, a), "better_than_percent": round(lower * 100 / total, 1) if total else 0,
+                  "percentile": percentile(ranked, a.score)}
         return Response({
             "exam": exam.title, "participants": total, "me": me,
             "top": [row(r, a) for r, a in ranked[:TOP]],

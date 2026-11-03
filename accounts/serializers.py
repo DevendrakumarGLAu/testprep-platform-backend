@@ -158,7 +158,7 @@ class ActivityLogSerializer(serializers.ModelSerializer):
 class PlatformSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = PlatformSettings
-        fields = ["platform_name", "allow_registration", "support_email"]
+        fields = ["platform_name", "allow_registration", "support_email", "support_phone", "support_hours"]
 
     def to_representation(self, instance):
         from .emails import email_enabled
@@ -166,6 +166,12 @@ class PlatformSettingsSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         data["email_enabled"] = email_enabled()  # the login page only offers "Forgot password?" when emails can be sent
         return data
+
+    def validate_support_phone(self, value):
+        return value.strip()
+
+    def validate_support_hours(self, value):
+        return value.strip()
 
     def validate_platform_name(self, value):
         value = value.strip()

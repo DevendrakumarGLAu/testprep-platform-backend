@@ -23,6 +23,7 @@ urlpatterns = [
     path("exams/<str:pid>/", views.StudentExamDetail.as_view()),
     path("exams/<str:pid>/start/", views.StartAttempt.as_view()),
     path("exams/<str:pid>/leaderboard/", leaderboard.Leaderboard.as_view()),
+    path("ranks/", leaderboard.MyRanks.as_view()),
     path("attempts/", views.AttemptHistory.as_view()),
     path("attempts/<str:pid>/", views.AttemptDetail.as_view()),
     path("attempts/<str:pid>/answers/", views.SaveAnswers.as_view()),

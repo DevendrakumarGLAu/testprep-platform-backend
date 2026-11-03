@@ -1,9 +1,10 @@
 from django.db import transaction
 from rest_framework import serializers
 
+from core.media import media_url
 from exams.models import Exam
 
-from .models import SeriesItem, StudyNote, TestSeries
+from .models import Popup, SeriesItem, StudyNote, TestSeries
 
 
 class StudyNoteSerializer(serializers.ModelSerializer):
@@ -69,3 +70,66 @@ class SeriesSerializer(serializers.ModelSerializer):
         if ids is not None:
             self._set_items(instance, ids)
         return instance
+
+
+class PopupSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+    batch_name = serializers.CharField(source="batch.name", read_only=True, default=None)
+    seen_count = serializers.SerializerMethodField()
+    audience_size = serializers.SerializerMethodField()
+    state = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Popup
+        fields = [
+            "id", "title", "body", "image_url", "link", "button_label", "audience", "category", "category_name", "batch", "batch_name",
+            "starts_at", "ends_at", "is_active", "seen_count", "audience_size", "state", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_image_url(self, obj):
+        return media_url(self.context.get("request"), obj.image.name) if obj.image else None
+
+    def get_seen_count(self, obj):
+        return obj.seen.count()
+
+    def get_audience_size(self, obj):
+        from .popups import audience_of
+
+        return audience_of(obj).count()
+
+    def get_state(self, obj):
+        from .popups import state_of
+
+        return state_of(obj)
+
+    def validate_title(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Give the pop-up a title.")
+        return value
+
+    def validate_link(self, value):
+        value = value.strip()
+        if value and not (value.startswith("/") and not value.startswith("//")) and not value.startswith("https://"):
+            raise serializers.ValidationError("Use a page of this app, such as /student/plan, or a full https:// address.")
+        return value
+
+    def validate(self, attrs):
+        get = lambda f, default=None: attrs.get(f, getattr(self.instance, f, default))  # noqa: E731
+        audience = get("audience", Popup.Audience.ALL)
+        if audience == Popup.Audience.EXAM and not get("category"):
+            raise serializers.ValidationError({"category": "Choose the exam."})
+        if audience == Popup.Audience.BATCH and not get("batch"):
+            raise serializers.ValidationError({"batch": "Choose the batch."})
+        if audience != Popup.Audience.EXAM:
+            attrs["category"] = None
+        if audience != Popup.Audience.BATCH:
+            attrs["batch"] = None
+        starts, ends = get("starts_at"), get("ends_at")
+        if starts and ends and ends <= starts:
+            raise serializers.ValidationError({"ends_at": "The end must be after the start."})
+        if get("link") and not (get("button_label") or "").strip():
+            attrs["button_label"] = "Open"
+        return attrs

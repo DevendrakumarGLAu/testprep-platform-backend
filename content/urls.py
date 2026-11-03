@@ -4,6 +4,7 @@ from . import views
 
 router = DefaultRouter()
 router.register("study-notes", views.StudyNoteViewSet, basename="study-note")
+router.register("popups", views.PopupViewSet, basename="popup")
 router.register("test-series", views.TestSeriesViewSet, basename="test-series")
 
 urlpatterns = router.urls
